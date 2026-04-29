@@ -24,7 +24,7 @@ env:
 
 jobs:
   rdp-session:
-    
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -102,6 +102,20 @@ jobs:
         with:
           path: C:\Users\rdpuser\.playwright-browsers
           key: playwright-browsers-v1-${{ runner.os }}
+
+      - name: Restore Brave browser cache
+        id: cache-brave
+        uses: actions/cache/restore@v5
+        with:
+          path: C:\Users\rdpuser\AppData\Local\BraveSoftware\Brave-Browser
+          key: brave-browser-v1-${{ runner.os }}
+
+      - name: Restore OpenClaw extension cache
+        id: cache-openclaw-extension
+        uses: actions/cache/restore@v5
+        with:
+          path: C:\Users\rdpuser\.openclaw\browser\chrome-extension
+          key: openclaw-extension-v1-${{ runner.os }}
 
       # ========== TAILSCALE SETUP ==========
       - name: Install Tailscale
@@ -375,7 +389,7 @@ jobs:
             Write-Host "  SKIP: Chrome already installed"
           }
           
-          # Brave: install for extension relay browser (headed mode via RDP)
+          # Brave: restore or install headed browser for extension relay via RDP
           $braveCandidates = @(
             "C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
             "C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
@@ -605,7 +619,7 @@ jobs:
           Write-Host "Playwright + Chromium ready at: $browsersPath"
         continue-on-error: true
 
-      - name: Install OpenClaw browser extension for Brave
+      - name: Configure Brave with OpenClaw extension
         shell: pwsh
         run: |
           $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
@@ -615,26 +629,9 @@ jobs:
           # Point openclaw at rdpuser's state dir so the extension installs there
           $env:OPENCLAW_STATE_DIR = "$rdpUserHome\.openclaw"
           
-          # Install the extension files
-          Write-Host "Installing OpenClaw browser extension..."
-          
-          # Check openclaw version and browser command availability
-          $ocVersion = openclaw --version 2>&1 | Out-String
-          Write-Host "OpenClaw version: $ocVersion"
-          
-          $browserHelp = openclaw browser --help 2>&1 | Out-String
-          Write-Host "Browser command help:`n$browserHelp"
-          
-          # The browser command takes no positional args in current OpenClaw builds.
-          # Running it once allows the extension bootstrap to create files if supported.
-          $installOutput = openclaw browser 2>&1 | Out-String
-          Write-Host "Extension output: $installOutput"
-          
-          # Check all possible locations for the extension directory
+          # Use the restored unpacked extension if available.
           $candidates = @(
-            "$rdpUserHome\.openclaw\browser\chrome-extension",
-            "$env:USERPROFILE\.openclaw\browser\chrome-extension",
-            "C:\Users\runneradmin\.openclaw\browser\chrome-extension"
+            "$rdpUserHome\.openclaw\browser\chrome-extension"
           )
           
           $extPath = $null
@@ -645,19 +642,27 @@ jobs:
             }
           }
           
-          # If found under runner's home but not rdpuser's, copy it over
-          if ($extPath -and $extPath -ne $candidates[0]) {
-            Write-Host "Extension found at $extPath, copying to rdpuser..."
-            $targetDir = "$rdpUserHome\.openclaw\browser\chrome-extension"
-            New-Item -ItemType Directory -Path (Split-Path $targetDir) -Force | Out-Null
-            Copy-Item -Path $extPath -Destination $targetDir -Recurse -Force
-            $extPath = $targetDir
+          # First-run bootstrap: if cache miss, try to let OpenClaw create the extension once.
+          if (-not $extPath -or -not (Test-Path $extPath)) {
+            Write-Host "Extension cache miss, attempting first-run bootstrap..."
+            $bootstrapOutput = openclaw browser 2>&1 | Out-String
+            $bootstrapExitCode = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+            Write-Host "Bootstrap output: $bootstrapOutput"
+            if ($bootstrapExitCode -ne 0) {
+              Write-Host "WARNING: Bootstrap command returned exit code $bootstrapExitCode"
+            }
+
+            if (Test-Path $candidates[0]) {
+              $extPath = $candidates[0]
+              Write-Host "Bootstrap created extension at $extPath"
+            }
           }
           
           Write-Host "Extension path resolved to: $extPath"
           
           if (-not $extPath -or -not (Test-Path $extPath)) {
-            Write-Host "WARNING: Extension path not found, skipping Brave extension setup"
+            Write-Host "WARNING: Extension path not found in cache, skipping Brave extension setup"
             exit 0
           }
           
@@ -1463,4 +1468,20 @@ jobs:
         with:
           path: C:\Users\rdpuser\.playwright-browsers
           key: playwright-browsers-v1-${{ runner.os }}
+        continue-on-error: true
+
+      - name: Save Brave browser cache
+        if: ${{ always() && steps.cache-brave.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v5
+        with:
+          path: C:\Users\rdpuser\AppData\Local\BraveSoftware\Brave-Browser
+          key: brave-browser-v1-${{ runner.os }}
+        continue-on-error: true
+
+      - name: Save OpenClaw extension cache
+        if: ${{ always() && steps.cache-openclaw-extension.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v5
+        with:
+          path: C:\Users\rdpuser\.openclaw\browser\chrome-extension
+          key: openclaw-extension-v1-${{ runner.os }}
         continue-on-error: true
