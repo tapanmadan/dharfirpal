@@ -24,7 +24,7 @@ env:
 
 jobs:
   rdp-session:
-    
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -506,6 +506,17 @@ jobs:
                 $config = $configObj | ConvertTo-Json -Depth 20
                 Write-Host "  Config sanitized (removed unrecognized keys)"
               }
+
+              # Remove stale plugin entries that are no longer supported by OpenClaw
+              if ($configObj.plugins -and $configObj.plugins.entries) {
+                $entries = @($configObj.plugins.entries)
+                $filteredEntries = @($entries | Where-Object { $_.name -ne "google-antigravity-auth" })
+                if ($filteredEntries.Count -ne $entries.Count) {
+                  Write-Host "  Removing stale plugin entry: google-antigravity-auth"
+                  $configObj.plugins.entries = $filteredEntries
+                  $config = $configObj | ConvertTo-Json -Depth 20
+                }
+              }
               
               # Ensure browser plugin is enabled (required for 'openclaw browser' CLI)
               # If plugins.allow exists, 'browser' must be in the list
@@ -551,18 +562,6 @@ jobs:
           $global:LASTEXITCODE = 0
           Write-Host "OpenClaw configured"
           
-      # ========== PATCH OPENCLAW ==========
-      - name: Patch OpenClaw (Antigravity models + endpoints)
-        shell: pwsh
-        run: |
-          $patchScript = Join-Path $env:GITHUB_WORKSPACE "patch-windows.ps1"
-          if (Test-Path $patchScript) {
-            Write-Host "Running OpenClaw patch script..."
-            & $patchScript
-          } else {
-            Write-Host "WARNING: patch-windows.ps1 not found in repo root -- skipping patching"
-          }
-
       # ========== BROWSER SETUP ==========
       - name: Install Playwright and Chromium for browser control
         shell: pwsh
@@ -626,9 +625,9 @@ jobs:
           $browserHelp = openclaw browser --help 2>&1 | Out-String
           Write-Host "Browser command help:`n$browserHelp"
           
-          # The extension subcommand may have different syntax depending on version
-          # Try 'openclaw browser extension' first (it may auto-install or show subcommands)
-          $installOutput = openclaw browser extension 2>&1 | Out-String
+          # The browser command takes no positional args in current OpenClaw builds.
+          # Running it once allows the extension bootstrap to create files if supported.
+          $installOutput = openclaw browser 2>&1 | Out-String
           Write-Host "Extension output: $installOutput"
           
           # Check all possible locations for the extension directory
@@ -837,19 +836,33 @@ jobs:
           # Start the openclaw browser (flag goes BEFORE subcommand per docs)
           # Try with --browser-profile first, fall back to default if not supported
           $startOutput = openclaw browser --browser-profile openclaw start 2>&1 | Out-String
+          $startExitCode = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
           if ($startOutput -match "unknown option") {
             Write-Host "WARNING: --browser-profile not supported, trying without profile flag..."
             $startOutput = openclaw browser start 2>&1 | Out-String
+            $startExitCode = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
           }
           Write-Host "Browser start output: $startOutput"
+          if ($startExitCode -ne 0 -and $startOutput -match "gateway timeout") {
+            Write-Host "WARNING: Browser start timed out but will be treated as non-fatal"
+          }
           Start-Sleep -Seconds 5
           
           # Check browser status
           $browserStatus = openclaw browser --browser-profile openclaw status 2>&1 | Out-String
+          $browserStatusExitCode = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
           if ($browserStatus -match "unknown option") {
             $browserStatus = openclaw browser status 2>&1 | Out-String
+            $browserStatusExitCode = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
           }
           Write-Host "Browser status: $browserStatus"
+          if ($browserStatusExitCode -ne 0 -and $browserStatus -match "gateway timeout") {
+            Write-Host "WARNING: Browser status timed out but will be treated as non-fatal"
+          }
           
           # Verify CDP is reachable on the configured port
           try {
@@ -877,6 +890,7 @@ jobs:
           } catch {
             Write-Host "WARNING: Browser CDP endpoint not reachable yet (gateway may auto-start it on first use)"
           }
+          $global:LASTEXITCODE = 0
         continue-on-error: true
 
       - name: Display Connection Info
