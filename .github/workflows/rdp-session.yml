@@ -24,7 +24,7 @@ env:
 
 jobs:
   rdp-session:
-    
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -72,6 +72,10 @@ jobs:
           echo "CHAIN_COUNT=$chainCount" >> $env:GITHUB_OUTPUT
           echo "OPENCLAW_CACHE_VERSION=$openclawCacheVersion" >> $env:GITHUB_OUTPUT
           echo "JOB_START_TICKS=$jobStartTicks" >> $env:GITHUB_OUTPUT
+          $snapshotSourceRunId = "${{ github.event.client_payload.snapshot_source_run_id }}"
+          if (-not [string]::IsNullOrEmpty($snapshotSourceRunId)) {
+            echo "SNAPSHOT_SOURCE_RUN_ID=$snapshotSourceRunId" >> $env:GITHUB_OUTPUT
+          }
           
           Write-Host "Session: $sessionId | Chain: $chainCount | Cache: $openclawCacheVersion"
 
@@ -722,29 +726,23 @@ jobs:
         run: |
           $repo = "${{ github.repository }}"
           $currentRunId = "${{ github.run_id }}"
+          $preferredRunId = "${{ steps.session.outputs.SNAPSHOT_SOURCE_RUN_ID }}"
           
-          # Brief wait for previous session's artifact upload
-          $maxWaitMinutes = 15
-          $waitedMinutes = 0
-          
-          while ($waitedMinutes -lt $maxWaitMinutes) {
-            $inProgressRuns = gh run list --repo $repo --workflow "rdp-session.yml" --status in_progress --json databaseId 2>$null | ConvertFrom-Json
-            $otherInProgress = $inProgressRuns | Where-Object { $_.databaseId -ne [int64]$currentRunId }
-            
-            if ($otherInProgress -and $otherInProgress.Count -gt 0) {
-              Write-Host "Previous session still running, waiting..."
-              Start-Sleep -Seconds 30
-              $waitedMinutes += 0.5
-            } else {
-              break
-            }
+          $artifactsJson = gh api "repos/$repo/actions/artifacts" 2>$null | ConvertFrom-Json
+          $artifacts = @($artifactsJson.artifacts | Where-Object { $_.name -eq "openclaw-workspace" -and -not $_.expired })
+
+          if ($preferredRunId) {
+            $result = $artifacts | Where-Object { "$($_.workflow_run.id)" -eq "$preferredRunId" } | Sort-Object created_at | Select-Object -Last 1
+          }
+
+          if (-not $result) {
+            # Find the newest non-expired workspace artifact so the next session
+            # restores the most recent completed handoff.
+            $result = $artifacts | Sort-Object created_at | Select-Object -Last 1
           }
           
-          # Find the latest artifact
-          $result = gh api "repos/$repo/actions/artifacts" --jq '[.artifacts[] | select(.name == "openclaw-workspace" and .expired == false)] | first | {id: .id, run_id: .workflow_run.id}' 2>$null | ConvertFrom-Json
-          
           if ($result -and $result.id) {
-            Write-Host "Found workspace artifact from run: $($result.run_id)"
+            Write-Host "Found workspace artifact from run: $($result.run_id) at $($result.created_at)"
             echo "RUN_ID=$($result.run_id)" >> $env:GITHUB_OUTPUT
             echo "FOUND=true" >> $env:GITHUB_OUTPUT
           } else {
@@ -913,13 +911,16 @@ jobs:
           # would overshoot the 360-min GitHub limit and get killed before chaining.
           $jobStart = [DateTime]::new([long]"${{ steps.session.outputs.JOB_START_TICKS }}")
           $chainTime = $jobStart.AddMinutes(${{ env.CHAIN_TRIGGER_MINUTES }})
-          $hardLimitTime = $jobStart.AddMinutes(350)  # Stop 10 min before GitHub 360 limit, leaving room for fallback steps
+          $hardLimitTime = $jobStart.AddMinutes(358)  # Stop 2 min before GitHub 360 limit, leaving room for fallback steps
           $saveInterval = ${{ env.SAVE_INTERVAL_MINUTES }}
           $rdpUserHome = "C:\Users\rdpuser"
           $repo = "${{ github.repository }}"
           $sessionId = "${{ steps.session.outputs.SESSION_ID }}"
           $chainCount = [int]"${{ steps.session.outputs.CHAIN_COUNT }}"
           $openclawCacheVersion = "${{ steps.session.outputs.OPENCLAW_CACHE_VERSION }}"
+          $uploaderRoot = Join-Path $env:RUNNER_TEMP "workspace-artifact-uploader"
+          $uploaderScript = Join-Path $uploaderRoot "upload-workspace.mjs"
+          $snapshotIntervalMinutes = 1
           
           $setupElapsed = [math]::Round(((Get-Date) - $jobStart).TotalMinutes, 1)
           $remainingMinutes = [math]::Round(($chainTime - (Get-Date)).TotalMinutes, 1)
@@ -928,7 +929,7 @@ jobs:
           Write-Host "  Job started:       $($jobStart.ToString('HH:mm:ss'))"
           Write-Host "  Setup took:        $setupElapsed min"
           Write-Host "  Chain trigger at:  $($chainTime.ToString('HH:mm:ss')) (${{ env.CHAIN_TRIGGER_MINUTES }} min from job start)"
-          Write-Host "  Hard limit at:     $($hardLimitTime.ToString('HH:mm:ss')) (350 min from job start)"
+          Write-Host "  Hard limit at:     $($hardLimitTime.ToString('HH:mm:ss')) (358 min from job start)"
           Write-Host "  Remaining:         $remainingMinutes min"
           Write-Host "  Save interval:     every $saveInterval min"
           Write-Host "  Upgrade openclaw:  Cancel workflow from GitHub Actions UI"
@@ -936,9 +937,83 @@ jobs:
           if ((Get-Date) -ge $chainTime) {
             Write-Host "WARNING: Setup took longer than chain window! Proceeding to chain immediately."
           }
+
+          function Ensure-WorkspaceUploader {
+            if (Test-Path $uploaderScript) {
+              return
+            }
+
+            New-Item -ItemType Directory -Path $uploaderRoot -Force | Out-Null
+            Write-Host "Installing custom artifact uploader..."
+            npm install --prefix $uploaderRoot --silent @actions/artifact | Out-Null
+
+            @(
+              'import { DefaultArtifactClient } from "@actions/artifact";',
+              '',
+              'const [artifactName, artifactPath] = process.argv.slice(2);',
+              'if (!artifactName || !artifactPath) {',
+              '  throw new Error("Missing artifact name or path");',
+              '}',
+              '',
+              'const client = new DefaultArtifactClient();',
+              'try {',
+              '  await client.deleteArtifact(artifactName);',
+              '} catch (error) {',
+              '  if (error?.name !== "ArtifactNotFoundError") {',
+              '    console.warn(`Unable to delete existing artifact: ${error.message}`);',
+              '  }',
+              '}',
+              '',
+              'await client.uploadArtifact(artifactName, [artifactPath], {',
+              '  retentionDays: 90,',
+              '  compressionLevel: 0',
+              '});',
+              '',
+              'console.log(`Uploaded ${artifactName}`);'
+            ) | Set-Content -Path $uploaderScript -Encoding UTF8
+          }
+
+          function Upload-WorkspaceSnapshot {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string]$SnapshotName
+            )
+
+            $workspace = "C:\Users\rdpuser\.openclaw\workspace"
+            if (-not (Test-Path $workspace)) {
+              Write-Host "  [SNAPSHOT] Workspace missing, skipping upload"
+              return $false
+            }
+
+            Ensure-WorkspaceUploader
+            $env:NODE_PATH = Join-Path $uploaderRoot "node_modules"
+
+            $maxRetries = 3
+            for ($i = 1; $i -le $maxRetries; $i++) {
+              Write-Host "  [SNAPSHOT] Uploading $SnapshotName (attempt $i/$maxRetries)..."
+              & node $uploaderScript $SnapshotName $workspace 2>&1 | ForEach-Object { Write-Host "    $_" }
+              if ($LASTEXITCODE -eq 0) {
+                Write-Host "  [SNAPSHOT] Uploaded $SnapshotName"
+                echo "SNAPSHOT_UPLOADED=true" >> $env:GITHUB_OUTPUT
+                return $true
+              }
+
+              Write-Host "  [SNAPSHOT] WARNING: upload failed with exit code $LASTEXITCODE"
+              if ($i -lt $maxRetries) {
+                Start-Sleep -Seconds 10
+              }
+            }
+
+            return $false
+          }
+
+          function Get-SnapshotName {
+            return "openclaw-workspace"
+          }
           
           # Track state
           $lastSaveTime = Get-Date
+          $lastSnapshotUploadTime = $jobStart
           $chainTriggered = $false
           $loopCount = 0
           # GC interval: force garbage collection every 30 iterations (~30 min)
@@ -973,6 +1048,7 @@ jobs:
                 session_id = $sessionId
                 chain_count = $nextChainCount
                 openclaw_cache_version = $openclawCacheVersion
+                snapshot_source_run_id = "${{ github.run_id }}"
               }
             } | ConvertTo-Json -Compress
             
@@ -1015,8 +1091,9 @@ jobs:
             }
           }
           
-          # Main keep-alive loop: runs from setup completion until hard limit
-          # At chainTime: saves secrets + triggers next session, then continues as phase 2
+          # Main keep-alive loop: runs from setup completion until chain time or hard limit.
+          # We stop at chain time so the workspace artifact can upload before the
+          # next session is dispatched, minimizing handoff downtime.
           while ((Get-Date) -lt $hardLimitTime) {
             $loopCount++
             $elapsed = [math]::Round(((Get-Date) - $jobStart).TotalMinutes, 1)
@@ -1194,19 +1271,32 @@ jobs:
             if (-not $chainTriggered -and (Get-Date) -ge $chainTime) {
               Write-Host ""
               Write-Host "=========================================="
-              Write-Host "  CHAIN TIME - saving and triggering"
+              Write-Host "  CHAIN TIME - saving, snapshotting, and triggering"
               Write-Host "=========================================="
               Save-Secrets
+              $snapshotName = Get-SnapshotName
+              $null = Upload-WorkspaceSnapshot -SnapshotName $snapshotName
+              $lastSnapshotUploadTime = Get-Date
               $chainTriggered = Trigger-Chain
               if ($chainTriggered) {
-                # Write marker so if: always() steps know chain was already done
                 echo "CHAIN_DONE=true" >> $env:GITHUB_OUTPUT
-                Write-Host "Chain triggered successfully - continuing as phase 2 until hard limit"
+                Write-Host "Chain triggered successfully - continuing phase 2 until hard limit"
               } else {
                 Write-Host "WARNING: Chain trigger failed - will retry via if:always() steps"
               }
+              Write-Host "Phase 1 complete - old session continues until hard limit"
               Write-Host "=========================================="
               Write-Host ""
+            }
+
+            if ($chainTriggered) {
+              $minutesSinceSnapshot = ((Get-Date) - $lastSnapshotUploadTime).TotalMinutes
+              if ($minutesSinceSnapshot -ge $snapshotIntervalMinutes -and (Get-Date) -lt $hardLimitTime) {
+                $snapshotName = Get-SnapshotName
+                if ($null -ne (Upload-WorkspaceSnapshot -SnapshotName $snapshotName)) {
+                  $lastSnapshotUploadTime = Get-Date
+                }
+              }
             }
             
             # Periodic garbage collection to prevent memory accumulation.
@@ -1347,6 +1437,67 @@ jobs:
           if-no-files-found: ignore
           overwrite: true
 
+      - name: Trigger next session
+        id: trigger-next-session
+        if: always()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          Write-Host "Triggering next session after workspace upload..."
+
+          $sessionId = "${{ steps.session.outputs.SESSION_ID }}"
+          $nextChainCount = [int]"${{ steps.session.outputs.CHAIN_COUNT }}" + 1
+          $openclawCacheVersion = "${{ steps.session.outputs.OPENCLAW_CACHE_VERSION }}"
+          $repo = "${{ github.repository }}"
+
+          # If workflow was cancelled, toggle version to force openclaw upgrade
+          $keepaliveOutcome = "${{ steps.keepalive.outcome }}"
+          if ($keepaliveOutcome -eq "cancelled") {
+            if ($openclawCacheVersion -eq "v1") {
+              $newVersion = "v2"
+            } else {
+              $newVersion = "v1"
+            }
+            Write-Host "=========================================="
+            Write-Host "CANCEL DETECTED - UPGRADING OPENCLAW"
+            Write-Host "  Previous cache version: $openclawCacheVersion"
+            Write-Host "  New cache version:      $newVersion"
+            Write-Host "=========================================="
+            $openclawCacheVersion = $newVersion
+          }
+
+          $body = @{
+            event_type = 'chain-rdp'
+            client_payload = @{
+              session_id = $sessionId
+              chain_count = $nextChainCount
+              openclaw_cache_version = $openclawCacheVersion
+            }
+          } | ConvertTo-Json -Compress
+
+          $maxRetries = 3
+          for ($i = 1; $i -le $maxRetries; $i++) {
+            try {
+              $body | gh api "repos/$repo/dispatches" --method POST --input -
+              if ($LASTEXITCODE -eq 0) {
+                Write-Host "Next session triggered successfully on attempt $i"
+                echo "CHAIN_DONE=true" >> $env:GITHUB_OUTPUT
+                break
+              }
+              Write-Host "WARNING: gh api exited with code $LASTEXITCODE (attempt $i/$maxRetries)"
+            } catch {
+              Write-Host "WARNING: Exception on attempt $i/$maxRetries - $_"
+            }
+            if ($i -lt $maxRetries) {
+              $wait = $i * 15
+              Write-Host "Retrying in $wait seconds..."
+              Start-Sleep -Seconds $wait
+            } else {
+              Write-Host "ERROR: All $maxRetries attempts to trigger next session failed!"
+            }
+          }
+
       - name: Trigger next session (fallback)
         if: always()
         shell: pwsh
@@ -1355,8 +1506,9 @@ jobs:
         run: |
           # Skip if keepalive already triggered the chain successfully
           $chainDone = "${{ steps.keepalive.outputs.CHAIN_DONE }}"
-          if ($chainDone -eq "true") {
-            Write-Host "Chain already triggered by keepalive loop - skipping fallback"
+          $triggerStepDone = "${{ steps.trigger-next-session.outputs.CHAIN_DONE }}"
+          if ($chainDone -eq "true" -or $triggerStepDone -eq "true") {
+            Write-Host "Chain already triggered - skipping fallback"
             exit 0
           }
           
