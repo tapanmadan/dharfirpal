@@ -24,7 +24,7 @@ env:
 
 jobs:
   rdp-session:
-    
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -806,7 +806,8 @@ jobs:
           
           # Wait for gateway to be ready
           Write-Host "Waiting for OpenClaw gateway to be ready..."
-          $maxWait = 30
+          # Keep startup snappy: only give the gateway a short head start.
+          $maxWait = 6
           $waited = 0
           while ($waited -lt $maxWait) {
             try {
@@ -840,48 +841,8 @@ jobs:
           if ($startExitCode -ne 0 -and $startOutput -match "gateway timeout") {
             Write-Host "WARNING: Browser start timed out but will be treated as non-fatal"
           }
-          Start-Sleep -Seconds 5
-          
-          # Check browser status
-          $browserStatus = openclaw browser --browser-profile openclaw status 2>&1 | Out-String
-          $browserStatusExitCode = $LASTEXITCODE
-          $global:LASTEXITCODE = 0
-          if ($browserStatus -match "unknown option") {
-            $browserStatus = openclaw browser status 2>&1 | Out-String
-            $browserStatusExitCode = $LASTEXITCODE
-            $global:LASTEXITCODE = 0
-          }
-          Write-Host "Browser status: $browserStatus"
-          if ($browserStatusExitCode -ne 0 -and $browserStatus -match "gateway timeout") {
-            Write-Host "WARNING: Browser status timed out but will be treated as non-fatal"
-          }
-          
-          # Verify CDP is reachable on the configured port
-          try {
-            $cdpCheck = Invoke-WebRequest -Uri "http://127.0.0.1:18800/json/version" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
-            Write-Host "Browser CDP endpoint is reachable on port 18800"
-            
-            # Apply stealth: set realistic user-agent via browser control API
-            $gatewayPort = 18789
-            $ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-            $body = @{ headers = @{ "User-Agent" = $ua } } | ConvertTo-Json -Compress
-            try {
-              Invoke-WebRequest -Uri "http://127.0.0.1:$gatewayPort/browser/set/headers?profile=openclaw" `
-                -Method POST -UseBasicParsing -TimeoutSec 5 `
-                -Headers @{ "Authorization" = "Bearer openclaw"; "Content-Type" = "application/json" } `
-                -Body $body -ErrorAction Stop | Out-Null
-              Write-Host "Stealth: User-Agent set"
-            } catch {
-              Write-Host "WARNING: Could not set User-Agent (non-critical)"
-            }
-            
-            # Apply stealth: set realistic locale and timezone
-            openclaw browser --browser-profile openclaw set locale en-US 2>$null
-            openclaw browser --browser-profile openclaw set timezone America/New_York 2>$null
-            Write-Host "Stealth: locale=en-US, timezone=America/New_York"
-          } catch {
-            Write-Host "WARNING: Browser CDP endpoint not reachable yet (gateway may auto-start it on first use)"
-          }
+          Start-Sleep -Seconds 2
+          Write-Host "OpenClaw browser start requested; skipping CDP verification for faster startup"
           $global:LASTEXITCODE = 0
         continue-on-error: true
 
