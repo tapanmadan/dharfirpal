@@ -24,7 +24,7 @@ env:
 
 jobs:
   rdp-session:
-    
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -645,7 +645,7 @@ jobs:
           # First-run bootstrap: if cache miss, try to let OpenClaw create the extension once.
           if (-not $extPath -or -not (Test-Path $extPath)) {
             Write-Host "Extension cache miss, attempting first-run bootstrap..."
-            $bootstrapOutput = openclaw browser 2>&1 | Out-String
+            $bootstrapOutput = openclaw browser --browser-profile openclaw start 2>&1 | Out-String
             $bootstrapExitCode = $LASTEXITCODE
             $global:LASTEXITCODE = 0
             Write-Host "Bootstrap output: $bootstrapOutput"
