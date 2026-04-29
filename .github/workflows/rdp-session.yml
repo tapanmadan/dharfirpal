@@ -24,8 +24,8 @@ env:
 
 jobs:
   rdp-session:
-    runs-on: windows-latest
-    timeout-minutes: 358
+    
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
