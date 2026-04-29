@@ -24,7 +24,7 @@ env:
 
 jobs:
   rdp-session:
-    
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -109,6 +109,13 @@ jobs:
         with:
           path: C:\Users\rdpuser\AppData\Local\BraveSoftware\Brave-Browser
           key: brave-browser-v1-${{ runner.os }}
+
+      - name: Restore VS Code cache
+        id: cache-vscode
+        uses: actions/cache/restore@v5
+        with:
+          path: C:\Program Files\Microsoft VS Code
+          key: vscode-v1-${{ runner.os }}
 
       - name: Restore OpenClaw extension cache
         id: cache-openclaw-extension
@@ -256,7 +263,9 @@ jobs:
             "$rdpUserHome\.npm-global",
             "$rdpUserHome\.local\bin",
             "$rdpUserHome\AppData\Roaming",
-            "$rdpUserHome\AppData\Local"
+            "$rdpUserHome\AppData\Local",
+            "$rdpUserHome\AppData\Local\BraveSoftware\Brave-Browser",
+            "$rdpUserHome\AppData\Local\BraveSoftware\Brave-Browser\User Data"
           )
           $dirs | ForEach-Object { New-Item -ItemType Directory -Path $_ -Force | Out-Null }
           
@@ -389,34 +398,12 @@ jobs:
             Write-Host "  SKIP: Chrome already installed"
           }
           
-          # Brave: restore or install headed browser for extension relay via RDP
-          $braveCandidates = @(
-            "C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
-            "C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
-            "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe",
-            "C:\Users\rdpuser\AppData\Local\BraveSoftware\Brave-Browser\Application\brave.exe"
-          )
-          $braveFound = $braveCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $braveFound) {
-            Write-Host "  INSTALL: Brave"
-            choco install -y brave --no-progress 2>&1 | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-              Write-Host "  Chocolatey failed for Brave, trying direct download..."
-              $braveInstaller = "$env:TEMP\brave-setup.exe"
-              try {
-                (New-Object System.Net.WebClient).DownloadFile("https://laptop-updates.brave.com/latest/winx64", $braveInstaller)
-                Start-Process -FilePath $braveInstaller -ArgumentList "/silent /install" -Wait -NoNewWindow
-                Write-Host "  OK: Brave installed via direct download"
-                Remove-Item $braveInstaller -Force -ErrorAction SilentlyContinue
-              } catch {
-                Write-Host "  WARNING: Brave direct download also failed - $_"
-              }
-            } else {
-              Write-Host "  OK: Brave installed via Chocolatey"
-            }
-          } else {
-            Write-Host "  SKIP: Brave already installed at $braveFound"
-          }
+          # Brave
+          Install-Tool -Name "brave" -ChocoPkg "brave" `
+            -TestPath "C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe" `
+            -DirectUrl "https://laptop-updates.brave.com/latest/winx64" `
+            -InstallerArgs "/silent /install" `
+            -InstallerType "exe"
           
           # Install uBlock Origin for Chrome via policy
           $chromeExtPath = "HKLM:\SOFTWARE\Policies\Google\Chrome\ExtensionInstallForcelist"
@@ -1476,6 +1463,14 @@ jobs:
         with:
           path: C:\Users\rdpuser\AppData\Local\BraveSoftware\Brave-Browser
           key: brave-browser-v1-${{ runner.os }}
+        continue-on-error: true
+
+      - name: Save VS Code cache
+        if: ${{ always() && steps.cache-vscode.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v5
+        with:
+          path: C:\Program Files\Microsoft VS Code
+          key: vscode-v1-${{ runner.os }}
         continue-on-error: true
 
       - name: Save OpenClaw extension cache
