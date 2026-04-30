@@ -15,6 +15,14 @@ on:
         description: 'Bump to force openclaw upgrade (e.g. v1 -> v2)'
         required: false
         default: 'v1'
+      chain_trigger_minutes:
+        description: 'Minutes from job start before chaining to the next session'
+        required: false
+        default: '335'
+      start_managed_browser:
+        description: 'Start OpenClaw managed browser during setup'
+        required: false
+        default: 'false'
   repository_dispatch:
     types: [chain-rdp]
 
@@ -24,7 +32,7 @@ env:
 
 jobs:
   rdp-session:
-    
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -66,14 +74,22 @@ jobs:
           }
           
           # Record job start time as ticks for accurate timeout calculation later
+          $chainTriggerMinutes = "${{ github.event.inputs.chain_trigger_minutes }}"
+          if ([string]::IsNullOrEmpty($chainTriggerMinutes)) {
+            $chainTriggerMinutes = 335
+          } else {
+            $chainTriggerMinutes = [int]$chainTriggerMinutes
+          }
+
           $jobStartTicks = (Get-Date).Ticks
           
           echo "SESSION_ID=$sessionId" >> $env:GITHUB_OUTPUT
           echo "CHAIN_COUNT=$chainCount" >> $env:GITHUB_OUTPUT
           echo "OPENCLAW_CACHE_VERSION=$openclawCacheVersion" >> $env:GITHUB_OUTPUT
+          echo "CHAIN_TRIGGER_MINUTES=$chainTriggerMinutes" >> $env:GITHUB_OUTPUT
           echo "JOB_START_TICKS=$jobStartTicks" >> $env:GITHUB_OUTPUT
-          
-          Write-Host "Session: $sessionId | Chain: $chainCount | Cache: $openclawCacheVersion"
+
+          Write-Host "Session: $sessionId | Chain: $chainCount | Cache: $openclawCacheVersion | Chain trigger: $chainTriggerMinutes"
 
       # ========== DEPENDENCY CACHING ==========
       # NOTE: Chocolatey caching removed intentionally. windows-latest already has
@@ -655,6 +671,7 @@ jobs:
           }
 
       - name: Start OpenClaw managed browser
+        if: github.event.inputs.start_managed_browser == 'true'
         shell: pwsh
         run: |
           $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
@@ -774,7 +791,7 @@ jobs:
           Write-Host "  $rdpUserHome\projects"
           Write-Host "  $rdpUserHome\.npm-global"
           Write-Host ""
-          Write-Host "Session will auto-chain at ~${{ env.CHAIN_TRIGGER_MINUTES }} minutes"
+          Write-Host "Session will auto-chain at ~${{ steps.session.outputs.CHAIN_TRIGGER_MINUTES }} minutes"
           Write-Host "=============================================="
 
       - name: Keep session alive (phase 1 - until chain trigger)
@@ -783,12 +800,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          OPENCLAW_BROWSER_ENABLED: ${{ github.event.inputs.start_managed_browser }}
         run: |
           # Calculate times from JOB START, not from now.
           # Phase 1 starts after setup (~5-20 min), so using (Get-Date) here
           # would overshoot the 360-min GitHub limit and get killed before chaining.
           $jobStart = [DateTime]::new([long]"${{ steps.session.outputs.JOB_START_TICKS }}")
-          $chainTime = $jobStart.AddMinutes(${{ env.CHAIN_TRIGGER_MINUTES }})
+          $chainTime = $jobStart.AddMinutes([int]"${{ steps.session.outputs.CHAIN_TRIGGER_MINUTES }}")
           $hardLimitTime = $jobStart.AddMinutes(350)  # Stop 10 min before GitHub 360 limit, leaving room for fallback steps
           $saveInterval = ${{ env.SAVE_INTERVAL_MINUTES }}
           $rdpUserHome = "C:\Users\rdpuser"
@@ -803,7 +821,7 @@ jobs:
           Write-Host "Phase 1: Keep alive until chain trigger"
           Write-Host "  Job started:       $($jobStart.ToString('HH:mm:ss'))"
           Write-Host "  Setup took:        $setupElapsed min"
-          Write-Host "  Chain trigger at:  $($chainTime.ToString('HH:mm:ss')) (${{ env.CHAIN_TRIGGER_MINUTES }} min from job start)"
+          Write-Host "  Chain trigger at:  $($chainTime.ToString('HH:mm:ss')) (${{ steps.session.outputs.CHAIN_TRIGGER_MINUTES }} min from job start)"
           Write-Host "  Hard limit at:     $($hardLimitTime.ToString('HH:mm:ss')) (350 min from job start)"
           Write-Host "  Remaining:         $remainingMinutes min"
           Write-Host "  Save interval:     every $saveInterval min"
@@ -962,75 +980,77 @@ jobs:
             # Release process list reference immediately
             $nodeProcs = $null
             
-            # Check if OpenClaw managed browser CDP is still reachable
-            try {
-              $cdpCheck = Invoke-WebRequest -Uri "http://127.0.0.1:18800/json/version" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
-              # Browser is reachable, reset fail counter
-              if ((Test-Path variable:script:browserFailCount) -and $script:browserFailCount -gt 0) {
-                Write-Host "  Browser CDP confirmed reachable (reset fail counter from $($script:browserFailCount))"
-              }
-              $script:browserFailCount = 0
-            } catch {
-              if (-not (Test-Path variable:script:browserFailCount)) { $script:browserFailCount = 0 }
-              $script:browserFailCount++
-              
-              if ($script:browserFailCount -le 3) {
-                Write-Host "  WARNING: Browser CDP not reachable on port 18800 (attempt $($script:browserFailCount)/3), attempting restart..."
+            if ($env:OPENCLAW_BROWSER_ENABLED -eq "true") {
+              # Check if OpenClaw managed browser CDP is still reachable
+              try {
+                $cdpCheck = Invoke-WebRequest -Uri "http://127.0.0.1:18800/json/version" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
+                # Browser is reachable, reset fail counter
+                if ((Test-Path variable:script:browserFailCount) -and $script:browserFailCount -gt 0) {
+                  Write-Host "  Browser CDP confirmed reachable (reset fail counter from $($script:browserFailCount))"
+                }
+                $script:browserFailCount = 0
+              } catch {
+                if (-not (Test-Path variable:script:browserFailCount)) { $script:browserFailCount = 0 }
+                $script:browserFailCount++
                 
-                # Try via gateway HTTP API (works regardless of which user the keepalive runs as)
-                $restarted = $false
-                try {
-                  $startResp = Invoke-WebRequest -Uri "http://127.0.0.1:18789/browser/start?profile=openclaw" `
-                    -Method POST -UseBasicParsing -TimeoutSec 10 `
-                    -Headers @{ "Authorization" = "Bearer openclaw" } `
-                    -ErrorAction Stop
-                  if ($startResp.StatusCode -eq 200) {
+                if ($script:browserFailCount -le 3) {
+                  Write-Host "  WARNING: Browser CDP not reachable on port 18800 (attempt $($script:browserFailCount)/3), attempting restart..."
+                  
+                  # Try via gateway HTTP API (works regardless of which user the keepalive runs as)
+                  $restarted = $false
+                  try {
+                    $startResp = Invoke-WebRequest -Uri "http://127.0.0.1:18789/browser/start?profile=openclaw" `
+                      -Method POST -UseBasicParsing -TimeoutSec 10 `
+                      -Headers @{ "Authorization" = "Bearer openclaw" } `
+                      -ErrorAction Stop
+                    if ($startResp.StatusCode -eq 200) {
+                      Start-Sleep -Seconds 8
+                      try {
+                        Invoke-WebRequest -Uri "http://127.0.0.1:18800/json/version" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop | Out-Null
+                        Write-Host "  Browser restarted successfully via gateway API"
+                        $restarted = $true
+                        $script:browserFailCount = 0
+                      } catch {
+                        Write-Host "  Gateway accepted start request but CDP still not reachable"
+                      }
+                    }
+                  } catch {
+                    Write-Host "  Gateway API start request failed: $($_.Exception.Message)"
+                  }
+                  
+                  # Fallback: try CLI as rdpuser via scheduled task
+                  if (-not $restarted) {
+                    $taskScript = "$rdpUserHome\start-browser.ps1"
+                    $scriptLines = @(
+                      ('$env:PATH = "' + $rdpUserHome + '\.npm-global;" + $env:PATH'),
+                      ('$env:PLAYWRIGHT_BROWSERS_PATH = "' + $rdpUserHome + '\.playwright-browsers"'),
+                      '$env:PLAYWRIGHT_CHROMIUM_USE_HEADLESS_NEW = "1"',
+                      'openclaw browser --browser-profile openclaw start 2>&1 | Out-Null'
+                    )
+                    $scriptLines -join "`r`n" | Out-File -FilePath $taskScript -Encoding UTF8 -Force
+                    $batchWrapper = "$rdpUserHome\start-browser.bat"
+                    $batchLines = '@echo off', ('powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $taskScript + '"')
+                    $batchLines -join "`r`n" | Out-File -FilePath $batchWrapper -Encoding ASCII -Force
+                    
+                    schtasks /Create /TN "OpenClawBrowserRestart" /TR $batchWrapper /SC ONCE /ST 00:00 /RU "rdpuser" /RP $env:RDP_PASSWORD /RL HIGHEST /F 2>$null
+                    schtasks /Run /TN "OpenClawBrowserRestart" 2>$null
                     Start-Sleep -Seconds 8
+                    
                     try {
                       Invoke-WebRequest -Uri "http://127.0.0.1:18800/json/version" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop | Out-Null
-                      Write-Host "  Browser restarted successfully via gateway API"
-                      $restarted = $true
+                      Write-Host "  Browser restarted successfully via scheduled task"
                       $script:browserFailCount = 0
                     } catch {
-                      Write-Host "  Gateway accepted start request but CDP still not reachable"
+                      Write-Host "  WARNING: Browser restart via scheduled task also failed"
                     }
                   }
-                } catch {
-                  Write-Host "  Gateway API start request failed: $($_.Exception.Message)"
+                } elseif ($script:browserFailCount -eq 4) {
+                  Write-Host "  Browser CDP failed 3 restart attempts - giving up automatic restarts."
+                  Write-Host "  The gateway will auto-start the browser on the next browser tool call."
+                  Write-Host "  Or RDP in and run: openclaw browser --browser-profile openclaw start"
                 }
-                
-                # Fallback: try CLI as rdpuser via scheduled task
-                if (-not $restarted) {
-                  $taskScript = "$rdpUserHome\start-browser.ps1"
-                  $scriptLines = @(
-                    ('$env:PATH = "' + $rdpUserHome + '\.npm-global;" + $env:PATH'),
-                    ('$env:PLAYWRIGHT_BROWSERS_PATH = "' + $rdpUserHome + '\.playwright-browsers"'),
-                    '$env:PLAYWRIGHT_CHROMIUM_USE_HEADLESS_NEW = "1"',
-                    'openclaw browser --browser-profile openclaw start 2>&1 | Out-Null'
-                  )
-                  $scriptLines -join "`r`n" | Out-File -FilePath $taskScript -Encoding UTF8 -Force
-                  $batchWrapper = "$rdpUserHome\start-browser.bat"
-                  $batchLines = '@echo off', ('powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $taskScript + '"')
-                  $batchLines -join "`r`n" | Out-File -FilePath $batchWrapper -Encoding ASCII -Force
-                  
-                  schtasks /Create /TN "OpenClawBrowserRestart" /TR $batchWrapper /SC ONCE /ST 00:00 /RU "rdpuser" /RP $env:RDP_PASSWORD /RL HIGHEST /F 2>$null
-                  schtasks /Run /TN "OpenClawBrowserRestart" 2>$null
-                  Start-Sleep -Seconds 8
-                  
-                  try {
-                    Invoke-WebRequest -Uri "http://127.0.0.1:18800/json/version" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop | Out-Null
-                    Write-Host "  Browser restarted successfully via scheduled task"
-                    $script:browserFailCount = 0
-                  } catch {
-                    Write-Host "  WARNING: Browser restart via scheduled task also failed"
-                  }
-                }
-              } elseif ($script:browserFailCount -eq 4) {
-                Write-Host "  Browser CDP failed 3 restart attempts - giving up automatic restarts."
-                Write-Host "  The gateway will auto-start the browser on the next browser tool call."
-                Write-Host "  Or RDP in and run: openclaw browser --browser-profile openclaw start"
+                # After giving up, stay silent (no spam every 60s)
               }
-              # After giving up, stay silent (no spam every 60s)
             }
             
             # Periodic secret save
