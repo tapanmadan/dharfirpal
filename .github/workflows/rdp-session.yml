@@ -24,7 +24,7 @@ env:
 
 jobs:
   rdp-session:
-    
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -483,6 +483,18 @@ jobs:
                 Write-Host "  Enabling browser in config"
                 $configObj.browser.enabled = $true
                 $config = $configObj | ConvertTo-Json -Depth 20
+              }
+
+              # Remove userDataDir if present (requires driver="existing-session")
+              if ($configObj.browser.profiles) {
+                foreach ($profileProp in $configObj.browser.profiles.PSObject.Properties) {
+                  $profile = $profileProp.Value
+                  if ($profile.PSObject.Properties["userDataDir"]) {
+                    Write-Host "  Removing userDataDir from profile '$($profileProp.Name)'"
+                    $profile.PSObject.Properties.Remove("userDataDir")
+                    $config = $configObj | ConvertTo-Json -Depth 20
+                  }
+                }
               }
 
             } catch {
