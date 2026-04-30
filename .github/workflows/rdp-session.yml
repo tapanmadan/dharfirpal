@@ -507,6 +507,22 @@ jobs:
                   $configObj.browser.profiles.openclaw | Add-Member -NotePropertyName "userDataDir" -NotePropertyValue $profileDir -Force
                   $config = $configObj | ConvertTo-Json -Depth 20
                 }
+
+                # Prefer Microsoft Edge if available
+                if (-not $configObj.browser.profiles.openclaw.executablePath) {
+                  $edgeCandidates = @(
+                    "C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+                    "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+                  )
+                  $edgePath = $edgeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+                  if ($edgePath) {
+                    Write-Host "  Setting openclaw profile executablePath to Edge"
+                    $configObj.browser.profiles.openclaw | Add-Member -NotePropertyName "executablePath" -NotePropertyValue $edgePath -Force
+                    $config = $configObj | ConvertTo-Json -Depth 20
+                  } else {
+                    Write-Host "  Edge not found, using default browser executable"
+                  }
+                }
               }
             } catch {
               Write-Host "  WARNING: Config sanitization failed (will write as-is): $_"
