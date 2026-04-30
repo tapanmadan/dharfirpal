@@ -24,7 +24,7 @@ env:
 
 jobs:
   rdp-session:
-    
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -327,13 +327,6 @@ jobs:
             Remove-Item $installer -Force -ErrorAction SilentlyContinue
           }
           
-          
-          # Notepad++
-          Install-Tool -Name "notepad++" -ChocoPkg "notepadplusplus" `
-            -TestPath "C:\Program Files\Notepad++\notepad++.exe" `
-            -DirectUrl "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.7.6/npp.8.7.6.Installer.x64.exe" `
-            -InstallerArgs "/S" `
-            -InstallerType "exe"
           
           # Firefox (skip if already installed)
           Install-Tool -Name "firefox" -ChocoPkg "firefox" `
