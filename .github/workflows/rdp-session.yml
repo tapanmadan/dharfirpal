@@ -24,7 +24,7 @@ env:
 
 jobs:
   rdp-session:
-    
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -520,10 +520,17 @@ jobs:
         run: |
           $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
           $openclawBin = "$rdpUserHome\.npm-global\node_modules\openclaw\openclaw.mjs"
+          $openclawConfig = "$rdpUserHome\.openclaw\openclaw.json"
           if (-not (Test-Path $openclawBin)) {
             Write-Host "OpenClaw binary not found at $openclawBin"
             exit 1
           }
+          if (-not (Test-Path $openclawConfig)) {
+            Write-Host "OpenClaw config not found at $openclawConfig"
+            exit 1
+          }
+          $env:OPENCLAW_STATE_DIR = "$rdpUserHome\.openclaw"
+          $env:OPENCLAW_CONFIG_PATH = $openclawConfig
           Write-Host "Running openclaw doctor..."
           try {
             node $openclawBin doctor 2>&1 | Out-String | Write-Host
