@@ -24,7 +24,7 @@ env:
 
 jobs:
   rdp-session:
-    
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -497,6 +497,23 @@ jobs:
                 }
               }
 
+              # Tune gateway channel health monitoring to reduce flaps
+              if (-not $configObj.gateway) {
+                $configObj | Add-Member -NotePropertyName "gateway" -NotePropertyValue @{} -Force
+              }
+              if (-not $configObj.gateway.channelHealthCheckMinutes) {
+                $configObj.gateway | Add-Member -NotePropertyName "channelHealthCheckMinutes" -NotePropertyValue 5 -Force
+                $config = $configObj | ConvertTo-Json -Depth 20
+              }
+              if (-not $configObj.gateway.channelStaleEventThresholdMinutes) {
+                $configObj.gateway | Add-Member -NotePropertyName "channelStaleEventThresholdMinutes" -NotePropertyValue 30 -Force
+                $config = $configObj | ConvertTo-Json -Depth 20
+              }
+              if (-not $configObj.gateway.channelMaxRestartsPerHour) {
+                $configObj.gateway | Add-Member -NotePropertyName "channelMaxRestartsPerHour" -NotePropertyValue 6 -Force
+                $config = $configObj | ConvertTo-Json -Depth 20
+              }
+
             } catch {
               Write-Host "  WARNING: Config sanitization failed (will write as-is): $_"
             }
@@ -520,34 +537,6 @@ jobs:
           $global:LASTEXITCODE = 0
           Write-Host "OpenClaw configured"
 
-      - name: Validate OpenClaw config
-        shell: pwsh
-        run: |
-          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
-          $openclawBin = "$rdpUserHome\.npm-global\node_modules\openclaw\openclaw.mjs"
-          $openclawConfig = "$rdpUserHome\.openclaw\openclaw.json"
-          if (-not (Test-Path $openclawBin)) {
-            Write-Host "OpenClaw binary not found at $openclawBin"
-            exit 1
-          }
-          if (-not (Test-Path $openclawConfig)) {
-            Write-Host "OpenClaw config not found at $openclawConfig"
-            exit 1
-          }
-          $env:OPENCLAW_STATE_DIR = "$rdpUserHome\.openclaw"
-          $env:OPENCLAW_CONFIG_PATH = $openclawConfig
-          Write-Host "Running openclaw doctor..."
-          try {
-            node $openclawBin doctor 2>&1 | Out-String | Write-Host
-          } catch {
-            Write-Host "openclaw doctor failed: $($_.Exception.Message)"
-          }
-          Write-Host "Running openclaw config validate..."
-          try {
-            node $openclawBin config validate 2>&1 | Out-String | Write-Host
-          } catch {
-            Write-Host "openclaw config validate failed: $($_.Exception.Message)"
-          }
 
       - name: Start OpenClaw gateway (early)
         shell: pwsh
@@ -668,23 +657,6 @@ jobs:
           $global:LASTEXITCODE = 0
           
           Write-Host "Playwright + Chromium ready at: $browsersPath"
-        continue-on-error: true
-
-      - name: Start OpenClaw managed browser (headed, persistent)
-        shell: pwsh
-        run: |
-          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
-          $env:NPM_CONFIG_PREFIX = "$rdpUserHome\.npm-global"
-          $env:PATH = "$rdpUserHome\.npm-global;$env:PATH"
-          $env:PLAYWRIGHT_BROWSERS_PATH = "$rdpUserHome\.playwright-browsers"
-          
-          Write-Host "Starting OpenClaw managed browser (headed, persistent profile)..."
-          $startOutput = openclaw browser --browser-profile openclaw start 2>&1 | Out-String
-          if ($startOutput -match "unknown option") {
-            Write-Host "WARNING: --browser-profile not supported, trying without profile flag..."
-            $startOutput = openclaw browser start 2>&1 | Out-String
-          }
-          Write-Host "Browser start output: $startOutput"
         continue-on-error: true
 
       - name: Find previous workspace artifact
@@ -874,15 +846,6 @@ jobs:
               $script:openclawFailCount = 0
             }
 
-            # One-time warm restart to ensure workspace loads after restore
-            if (-not (Test-Path variable:script:didWarmRestart)) { $script:didWarmRestart = $false }
-            if (-not $script:didWarmRestart) {
-              Write-Host "  Performing one-time OpenClaw warm restart to load workspace"
-              taskkill /F /IM node.exe 2>$null
-              Start-Sleep -Seconds 2
-              schtasks /Run /TN "OpenClawGateway" 2>$null
-              $script:didWarmRestart = $true
-            }
             
             # Check if OpenClaw is running, restart if not (with backoff and error capture)
             $nodeProcs = Get-Process -Name "node" -ErrorAction SilentlyContinue
@@ -929,7 +892,19 @@ jobs:
             }
             # Release process list reference immediately
             $nodeProcs = $null
-            
+
+            # Quick gateway health ping (non-blocking)
+            try {
+              $gwResp = Invoke-WebRequest -Uri "http://127.0.0.1:18789/" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
+              if ($gwResp.StatusCode -ne 200 -and $gwResp.StatusCode -ne 401) {
+                Write-Host "  WARNING: Gateway unhealthy (status $($gwResp.StatusCode)), restarting gateway task"
+                schtasks /Run /TN "OpenClawGateway" 2>$null
+              }
+            } catch {
+              Write-Host "  WARNING: Gateway not responding, restarting gateway task"
+              schtasks /Run /TN "OpenClawGateway" 2>$null
+            }
+
             # Periodic secret save
             $sinceLastSave = ((Get-Date) - $lastSaveTime).TotalMinutes
             if ($sinceLastSave -ge $saveInterval) {
