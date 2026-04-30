@@ -24,7 +24,7 @@ env:
 
 jobs:
   rdp-session:
-    
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -493,6 +493,15 @@ jobs:
                     $profile.PSObject.Properties.Remove("userDataDir")
                     $config = $configObj | ConvertTo-Json -Depth 20
                   }
+                }
+              }
+
+              # Remove stale plugin entries that crash/restart the gateway
+              if ($configObj.plugins -and $configObj.plugins.entries) {
+                if ($configObj.plugins.entries.PSObject.Properties["google-antigravity-auth"]) {
+                  Write-Host "  Removing stale plugin entry: google-antigravity-auth"
+                  $configObj.plugins.entries.PSObject.Properties.Remove("google-antigravity-auth")
+                  $config = $configObj | ConvertTo-Json -Depth 20
                 }
               }
 
