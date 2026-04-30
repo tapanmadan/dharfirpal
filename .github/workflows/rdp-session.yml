@@ -24,7 +24,7 @@ env:
 
 jobs:
   rdp-session:
-    
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -421,7 +421,6 @@ jobs:
         shell: pwsh
         env:
           OPENCLAW_CONFIG: ${{ secrets.OPENCLAW_CONFIG }}
-          OPENCLAW_AUTH_PROFILES: ${{ secrets.OPENCLAW_AUTH_PROFILES }}
         run: |
           $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
           $openclawDir = "$rdpUserHome\.openclaw"
@@ -525,14 +524,6 @@ jobs:
             exit 1
           }
           
-          # Inject auth-profiles.json from secret
-          if ($env:OPENCLAW_AUTH_PROFILES) {
-            $env:OPENCLAW_AUTH_PROFILES | Out-File -FilePath "$openclawDir\agents\main\agent\auth-profiles.json" -Encoding UTF8
-            Write-Host "Injected auth-profiles.json from secret"
-          } else {
-            Write-Host "WARNING: No OPENCLAW_AUTH_PROFILES secret found"
-          }
-          
           $null = cmd /c "icacls `"$openclawDir`" /grant rdpuser:(OI)(CI)F /T /Q 2>&1"
           $global:LASTEXITCODE = 0
           Write-Host "OpenClaw configured"
@@ -571,6 +562,41 @@ jobs:
           } else {
             Write-Host "WARNING: Could not create scheduled task"
           }
+
+      - name: Check OpenClaw gateway health (early)
+        shell: pwsh
+        run: |
+          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
+          $env:OPENCLAW_STATE_DIR = "$rdpUserHome\.openclaw"
+          $env:OPENCLAW_CONFIG_PATH = "$rdpUserHome\.openclaw\openclaw.json"
+          $healthy = $false
+          for ($i = 1; $i -le 3; $i++) {
+            try {
+              $resp = Invoke-WebRequest -Uri "http://127.0.0.1:18789/" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
+              if ($resp.StatusCode -eq 200 -or $resp.StatusCode -eq 401) {
+                Write-Host "Gateway responded with status $($resp.StatusCode)"
+                $healthy = $true
+                break
+              }
+            } catch {
+              Start-Sleep -Seconds 5
+            }
+          }
+          if (-not $healthy) {
+            Write-Host "WARNING: Gateway not responding after early start"
+            $logFile = "$rdpUserHome\.openclaw\gateway-crash.log"
+            if (Test-Path $logFile) {
+              $crashLog = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
+              if ($crashLog) {
+                Write-Host "--- gateway crash log (last 500 chars) ---"
+                Write-Host ($crashLog.Substring([Math]::Max(0, $crashLog.Length - 500)))
+                Write-Host "--- end crash log ---"
+              }
+            } else {
+              Write-Host "No gateway crash log found at $logFile"
+            }
+          }
+        continue-on-error: true
           
 
       - name: Display Connection Info
@@ -892,18 +918,6 @@ jobs:
             }
             # Release process list reference immediately
             $nodeProcs = $null
-
-            # Quick gateway health ping (non-blocking)
-            try {
-              $gwResp = Invoke-WebRequest -Uri "http://127.0.0.1:18789/" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
-              if ($gwResp.StatusCode -ne 200 -and $gwResp.StatusCode -ne 401) {
-                Write-Host "  WARNING: Gateway unhealthy (status $($gwResp.StatusCode)), restarting gateway task"
-                schtasks /Run /TN "OpenClawGateway" 2>$null
-              }
-            } catch {
-              Write-Host "  WARNING: Gateway not responding, restarting gateway task"
-              schtasks /Run /TN "OpenClawGateway" 2>$null
-            }
 
             # Periodic secret save
             $sinceLastSave = ((Get-Date) - $lastSaveTime).TotalMinutes
