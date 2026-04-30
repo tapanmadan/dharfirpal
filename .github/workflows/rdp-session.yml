@@ -492,38 +492,6 @@ jobs:
                 $config = $configObj | ConvertTo-Json -Depth 20
               }
 
-              # Prefer headed browser for higher compatibility
-              if ($configObj.browser.headless -ne $false) {
-                Write-Host "  Setting browser.headless=false"
-                $configObj.browser.headless = $false
-                $config = $configObj | ConvertTo-Json -Depth 20
-              }
-
-              # Ensure persistent profile directory for openclaw browser
-              if ($configObj.browser.profiles -and $configObj.browser.profiles.openclaw) {
-                $profileDir = "$rdpUserHome\.openclaw\browser\profiles\openclaw"
-                if (-not $configObj.browser.profiles.openclaw.userDataDir) {
-                  Write-Host "  Setting openclaw profile userDataDir"
-                  $configObj.browser.profiles.openclaw | Add-Member -NotePropertyName "userDataDir" -NotePropertyValue $profileDir -Force
-                  $config = $configObj | ConvertTo-Json -Depth 20
-                }
-
-                # Prefer Microsoft Edge if config already supports executablePath
-                if ($configObj.browser.profiles.openclaw.executablePath) {
-                  $edgeCandidates = @(
-                    "C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-                    "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
-                  )
-                  $edgePath = $edgeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-                  if ($edgePath) {
-                    Write-Host "  Setting openclaw profile executablePath to Edge"
-                    $configObj.browser.profiles.openclaw.executablePath = $edgePath
-                    $config = $configObj | ConvertTo-Json -Depth 20
-                  } else {
-                    Write-Host "  Edge not found, using default browser executable"
-                  }
-                }
-              }
             } catch {
               Write-Host "  WARNING: Config sanitization failed (will write as-is): $_"
             }
@@ -546,6 +514,22 @@ jobs:
           $null = cmd /c "icacls `"$openclawDir`" /grant rdpuser:(OI)(CI)F /T /Q 2>&1"
           $global:LASTEXITCODE = 0
           Write-Host "OpenClaw configured"
+
+      - name: Validate OpenClaw config
+        shell: pwsh
+        run: |
+          Write-Host "Running openclaw doctor..."
+          try {
+            openclaw doctor 2>&1 | Out-String | Write-Host
+          } catch {
+            Write-Host "openclaw doctor failed: $($_.Exception.Message)"
+          }
+          Write-Host "Running openclaw config validate..."
+          try {
+            openclaw config validate 2>&1 | Out-String | Write-Host
+          } catch {
+            Write-Host "openclaw config validate failed: $($_.Exception.Message)"
+          }
 
       - name: Start OpenClaw gateway (early)
         shell: pwsh
