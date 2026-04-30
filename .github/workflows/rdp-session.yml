@@ -24,7 +24,7 @@ env:
 
 jobs:
   rdp-session:
-    
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -102,6 +102,7 @@ jobs:
         with:
           path: C:\Users\rdpuser\.playwright-browsers
           key: playwright-browsers-v1-${{ runner.os }}
+
 
       # ========== TAILSCALE SETUP ==========
       - name: Install Tailscale
@@ -238,6 +239,7 @@ jobs:
             "$rdpUserHome\projects",
             "$rdpUserHome\.openclaw",
             "$rdpUserHome\.openclaw\workspace",
+            "$rdpUserHome\.openclaw\browser\profiles\openclaw",
             "$rdpUserHome\.openclaw\agents\main\agent",
             "$rdpUserHome\.npm-global",
             "$rdpUserHome\.local\bin",
@@ -325,12 +327,6 @@ jobs:
             Remove-Item $installer -Force -ErrorAction SilentlyContinue
           }
           
-          # VS Code
-          Install-Tool -Name "vscode" -ChocoPkg "vscode.install" `
-            -TestPath "C:\Program Files\Microsoft VS Code\Code.exe" `
-            -DirectUrl "https://update.code.visualstudio.com/latest/win32-x64/stable" `
-            -InstallerArgs "/verysilent /norestart /mergetasks=!runcode,addcontextmenufiles,addcontextmenufolders,addtopath" `
-            -InstallerType "exe"
           
           # Notepad++
           Install-Tool -Name "notepad++" -ChocoPkg "notepadplusplus" `
@@ -495,6 +491,23 @@ jobs:
                 $configObj.browser.enabled = $true
                 $config = $configObj | ConvertTo-Json -Depth 20
               }
+
+              # Prefer headed browser for higher compatibility
+              if ($configObj.browser.headless -ne $false) {
+                Write-Host "  Setting browser.headless=false"
+                $configObj.browser.headless = $false
+                $config = $configObj | ConvertTo-Json -Depth 20
+              }
+
+              # Ensure persistent profile directory for openclaw browser
+              if ($configObj.browser.profiles -and $configObj.browser.profiles.openclaw) {
+                $profileDir = "$rdpUserHome\.openclaw\browser\profiles\openclaw"
+                if (-not $configObj.browser.profiles.openclaw.userDataDir) {
+                  Write-Host "  Setting openclaw profile userDataDir"
+                  $configObj.browser.profiles.openclaw | Add-Member -NotePropertyName "userDataDir" -NotePropertyValue $profileDir -Force
+                  $config = $configObj | ConvertTo-Json -Depth 20
+                }
+              }
             } catch {
               Write-Host "  WARNING: Config sanitization failed (will write as-is): $_"
             }
@@ -564,54 +577,6 @@ jobs:
             Write-Host "WARNING: patch-windows.ps1 not found in repo root -- skipping patching"
           }
 
-
-      - name: Find previous workspace artifact
-        id: find-artifact
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-        run: |
-          $repo = "${{ github.repository }}"
-          $currentRunId = "${{ github.run_id }}"
-          
-          # Brief wait for previous session's artifact upload
-          $maxWaitMinutes = 15
-          $waitedMinutes = 0
-          
-          while ($waitedMinutes -lt $maxWaitMinutes) {
-            $inProgressRuns = gh run list --repo $repo --workflow "rdp-session.yml" --status in_progress --json databaseId 2>$null | ConvertFrom-Json
-            $otherInProgress = $inProgressRuns | Where-Object { $_.databaseId -ne [int64]$currentRunId }
-            
-            if ($otherInProgress -and $otherInProgress.Count -gt 0) {
-              Write-Host "Previous session still running, waiting..."
-              Start-Sleep -Seconds 30
-              $waitedMinutes += 0.5
-            } else {
-              break
-            }
-          }
-          
-          # Find the latest artifact
-          $result = gh api "repos/$repo/actions/artifacts" --jq '[.artifacts[] | select(.name == "openclaw-workspace" and .expired == false)] | first | {id: .id, run_id: .workflow_run.id}' 2>$null | ConvertFrom-Json
-          
-          if ($result -and $result.id) {
-            Write-Host "Found workspace artifact from run: $($result.run_id)"
-            echo "RUN_ID=$($result.run_id)" >> $env:GITHUB_OUTPUT
-            echo "FOUND=true" >> $env:GITHUB_OUTPUT
-          } else {
-            Write-Host "No previous workspace artifact found"
-            echo "FOUND=false" >> $env:GITHUB_OUTPUT
-          }
-
-      - name: Restore workspace from artifact
-        if: steps.find-artifact.outputs.FOUND == 'true'
-        uses: actions/download-artifact@v7
-        with:
-          name: openclaw-workspace
-          path: C:\Users\rdpuser\.openclaw\workspace
-          github-token: ${{ secrets.GH_PAT }}
-          run-id: ${{ steps.find-artifact.outputs.RUN_ID }}
-        continue-on-error: true
 
       - name: Display Connection Info
         shell: pwsh
@@ -699,7 +664,7 @@ jobs:
           Write-Host "Playwright + Chromium ready at: $browsersPath"
         continue-on-error: true
 
-      - name: Start OpenClaw managed browser (best-effort)
+      - name: Start OpenClaw managed browser (headed, persistent)
         shell: pwsh
         run: |
           $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
@@ -707,17 +672,61 @@ jobs:
           $env:PATH = "$rdpUserHome\.npm-global;$env:PATH"
           $env:PLAYWRIGHT_BROWSERS_PATH = "$rdpUserHome\.playwright-browsers"
           
-          Write-Host "Starting OpenClaw managed browser (headless, no-sandbox)..."
-          $env:PLAYWRIGHT_CHROMIUM_USE_HEADLESS_NEW = "1"
-          
-          # Start the openclaw browser (flag goes BEFORE subcommand per docs)
-          # Try with --browser-profile first, fall back to default if not supported
+          Write-Host "Starting OpenClaw managed browser (headed, persistent profile)..."
           $startOutput = openclaw browser --browser-profile openclaw start 2>&1 | Out-String
           if ($startOutput -match "unknown option") {
             Write-Host "WARNING: --browser-profile not supported, trying without profile flag..."
             $startOutput = openclaw browser start 2>&1 | Out-String
           }
           Write-Host "Browser start output: $startOutput"
+        continue-on-error: true
+
+      - name: Find previous workspace artifact
+        id: find-artifact
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          $repo = "${{ github.repository }}"
+          $currentRunId = "${{ github.run_id }}"
+          
+          # Brief wait for previous session's artifact upload
+          $maxWaitMinutes = 15
+          $waitedMinutes = 0
+          
+          while ($waitedMinutes -lt $maxWaitMinutes) {
+            $inProgressRuns = gh run list --repo $repo --workflow "rdp-session.yml" --status in_progress --json databaseId 2>$null | ConvertFrom-Json
+            $otherInProgress = $inProgressRuns | Where-Object { $_.databaseId -ne [int64]$currentRunId }
+            
+            if ($otherInProgress -and $otherInProgress.Count -gt 0) {
+              Write-Host "Previous session still running, waiting..."
+              Start-Sleep -Seconds 30
+              $waitedMinutes += 0.5
+            } else {
+              break
+            }
+          }
+          
+          # Find the latest artifact
+          $result = gh api "repos/$repo/actions/artifacts" --jq '[.artifacts[] | select(.name == "openclaw-workspace" and .expired == false)] | first | {id: .id, run_id: .workflow_run.id}' 2>$null | ConvertFrom-Json
+          
+          if ($result -and $result.id) {
+            Write-Host "Found workspace artifact from run: $($result.run_id)"
+            echo "RUN_ID=$($result.run_id)" >> $env:GITHUB_OUTPUT
+            echo "FOUND=true" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Host "No previous workspace artifact found"
+            echo "FOUND=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Restore workspace from artifact
+        if: steps.find-artifact.outputs.FOUND == 'true'
+        uses: actions/download-artifact@v7
+        with:
+          name: openclaw-workspace
+          path: C:\Users\rdpuser\.openclaw\workspace
+          github-token: ${{ secrets.GH_PAT }}
+          run-id: ${{ steps.find-artifact.outputs.RUN_ID }}
         continue-on-error: true
 
       - name: Keep session alive (phase 1 - until chain trigger)
@@ -904,77 +913,6 @@ jobs:
             }
             # Release process list reference immediately
             $nodeProcs = $null
-            
-            # Check if OpenClaw managed browser CDP is still reachable
-            try {
-              $cdpCheck = Invoke-WebRequest -Uri "http://127.0.0.1:18800/json/version" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
-              # Browser is reachable, reset fail counter
-              if ((Test-Path variable:script:browserFailCount) -and $script:browserFailCount -gt 0) {
-                Write-Host "  Browser CDP confirmed reachable (reset fail counter from $($script:browserFailCount))"
-              }
-              $script:browserFailCount = 0
-            } catch {
-              if (-not (Test-Path variable:script:browserFailCount)) { $script:browserFailCount = 0 }
-              $script:browserFailCount++
-              
-              if ($script:browserFailCount -le 3) {
-                Write-Host "  WARNING: Browser CDP not reachable on port 18800 (attempt $($script:browserFailCount)/3), attempting restart..."
-                
-                # Try via gateway HTTP API (works regardless of which user the keepalive runs as)
-                $restarted = $false
-                try {
-                  $startResp = Invoke-WebRequest -Uri "http://127.0.0.1:18789/browser/start?profile=openclaw" `
-                    -Method POST -UseBasicParsing -TimeoutSec 10 `
-                    -Headers @{ "Authorization" = "Bearer openclaw" } `
-                    -ErrorAction Stop
-                  if ($startResp.StatusCode -eq 200) {
-                    Start-Sleep -Seconds 8
-                    try {
-                      Invoke-WebRequest -Uri "http://127.0.0.1:18800/json/version" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop | Out-Null
-                      Write-Host "  Browser restarted successfully via gateway API"
-                      $restarted = $true
-                      $script:browserFailCount = 0
-                    } catch {
-                      Write-Host "  Gateway accepted start request but CDP still not reachable"
-                    }
-                  }
-                } catch {
-                  Write-Host "  Gateway API start request failed: $($_.Exception.Message)"
-                }
-                
-                # Fallback: try CLI as rdpuser via scheduled task
-                if (-not $restarted) {
-                  $taskScript = "$rdpUserHome\start-browser.ps1"
-                  $scriptLines = @(
-                    ('$env:PATH = "' + $rdpUserHome + '\.npm-global;" + $env:PATH'),
-                    ('$env:PLAYWRIGHT_BROWSERS_PATH = "' + $rdpUserHome + '\.playwright-browsers"'),
-                    '$env:PLAYWRIGHT_CHROMIUM_USE_HEADLESS_NEW = "1"',
-                    'openclaw browser --browser-profile openclaw start 2>&1 | Out-Null'
-                  )
-                  $scriptLines -join "`r`n" | Out-File -FilePath $taskScript -Encoding UTF8 -Force
-                  $batchWrapper = "$rdpUserHome\start-browser.bat"
-                  $batchLines = '@echo off', ('powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $taskScript + '"')
-                  $batchLines -join "`r`n" | Out-File -FilePath $batchWrapper -Encoding ASCII -Force
-                  
-                  schtasks /Create /TN "OpenClawBrowserRestart" /TR $batchWrapper /SC ONCE /ST 00:00 /RU "rdpuser" /RP $env:RDP_PASSWORD /RL HIGHEST /F 2>$null
-                  schtasks /Run /TN "OpenClawBrowserRestart" 2>$null
-                  Start-Sleep -Seconds 8
-                  
-                  try {
-                    Invoke-WebRequest -Uri "http://127.0.0.1:18800/json/version" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop | Out-Null
-                    Write-Host "  Browser restarted successfully via scheduled task"
-                    $script:browserFailCount = 0
-                  } catch {
-                    Write-Host "  WARNING: Browser restart via scheduled task also failed"
-                  }
-                }
-              } elseif ($script:browserFailCount -eq 4) {
-                Write-Host "  Browser CDP failed 3 restart attempts - giving up automatic restarts."
-                Write-Host "  The gateway will auto-start the browser on the next browser tool call."
-                Write-Host "  Or RDP in and run: openclaw browser --browser-profile openclaw start"
-              }
-              # After giving up, stay silent (no spam every 60s)
-            }
             
             # Periodic secret save
             $sinceLastSave = ((Get-Date) - $lastSaveTime).TotalMinutes
