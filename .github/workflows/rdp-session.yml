@@ -24,7 +24,7 @@ env:
 
 jobs:
   rdp-session:
-    
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -139,6 +139,22 @@ jobs:
           . "$env:GITHUB_WORKSPACE\workflow-timeout.ps1"
           $sessionId = "${{ steps.session.outputs.SESSION_ID }}"
           $hostname = "gh-rdp-$sessionId"
+          $tailscaleExe = (Get-Command tailscale.exe -ErrorAction SilentlyContinue).Source
+          if (-not $tailscaleExe) {
+            $candidates = @(
+              "C:\Program Files\Tailscale\tailscale.exe",
+              "C:\Program Files\Tailscale IPN\tailscale.exe"
+            )
+            foreach ($candidate in $candidates) {
+              if (Test-Path $candidate) {
+                $tailscaleExe = $candidate
+                break
+              }
+            }
+          }
+          if (-not $tailscaleExe) {
+            throw "tailscale.exe not found after install"
+          }
           
           Invoke-WithTimeout -Activity "Starting Tailscale service" -TimeoutSeconds 120 -ScriptBlock {
             Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue
@@ -146,17 +162,17 @@ jobs:
           Start-Sleep -Seconds 5
           
           Invoke-WithTimeout -Activity "Connecting Tailscale" -TimeoutSeconds 900 -ScriptBlock {
-            param($AuthKey, $HostName)
-            & "C:\Program Files\Tailscale\tailscale.exe" up `
+            param($AuthKey, $HostName, $TailscalePath)
+            & $TailscalePath up `
               --authkey="$AuthKey" `
               --hostname="$HostName" `
               --accept-routes `
               --accept-dns
-          } -ArgumentList $env:TAILSCALE_AUTHKEY, $hostname | Out-Null
+          } -ArgumentList $env:TAILSCALE_AUTHKEY, $hostname, $tailscaleExe | Out-Null
           
           Start-Sleep -Seconds 10
           
-          $status = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          $status = & $tailscaleExe ip -4
           Write-Host "=========================================="
           Write-Host "TAILSCALE IP: $status"
           Write-Host "HOSTNAME: $hostname"
@@ -686,7 +702,24 @@ jobs:
       - name: Display Connection Info
         shell: pwsh
         run: |
-          $tailscaleIp = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          $tailscaleExe = (Get-Command tailscale.exe -ErrorAction SilentlyContinue).Source
+          if (-not $tailscaleExe) {
+            $candidates = @(
+              "C:\Program Files\Tailscale\tailscale.exe",
+              "C:\Program Files\Tailscale IPN\tailscale.exe"
+            )
+            foreach ($candidate in $candidates) {
+              if (Test-Path $candidate) {
+                $tailscaleExe = $candidate
+                break
+              }
+            }
+          }
+          if (-not $tailscaleExe) {
+            throw "tailscale.exe not found when displaying connection info"
+          }
+
+          $tailscaleIp = & $tailscaleExe ip -4
           $sessionId = "${{ steps.session.outputs.SESSION_ID }}"
           $chainCount = "${{ steps.session.outputs.CHAIN_COUNT }}"
           $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
