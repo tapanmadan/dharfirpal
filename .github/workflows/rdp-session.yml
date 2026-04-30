@@ -518,15 +518,21 @@ jobs:
       - name: Validate OpenClaw config
         shell: pwsh
         run: |
+          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
+          $openclawBin = "$rdpUserHome\.npm-global\node_modules\openclaw\openclaw.mjs"
+          if (-not (Test-Path $openclawBin)) {
+            Write-Host "OpenClaw binary not found at $openclawBin"
+            exit 1
+          }
           Write-Host "Running openclaw doctor..."
           try {
-            openclaw doctor 2>&1 | Out-String | Write-Host
+            node $openclawBin doctor 2>&1 | Out-String | Write-Host
           } catch {
             Write-Host "openclaw doctor failed: $($_.Exception.Message)"
           }
           Write-Host "Running openclaw config validate..."
           try {
-            openclaw config validate 2>&1 | Out-String | Write-Host
+            node $openclawBin config validate 2>&1 | Out-String | Write-Host
           } catch {
             Write-Host "openclaw config validate failed: $($_.Exception.Message)"
           }
