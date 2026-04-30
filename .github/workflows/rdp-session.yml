@@ -24,7 +24,7 @@ env:
 
 jobs:
   rdp-session:
-    
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -125,11 +125,20 @@ jobs:
           
           Invoke-WithTimeout -Activity "Installing Tailscale MSI" -TimeoutSeconds 900 -ScriptBlock {
             param($InstallerPath)
-            Start-Process msiexec.exe -ArgumentList "/i", $InstallerPath, "/quiet", "/norestart" -Wait
+            $proc = Start-Process msiexec.exe -ArgumentList "/i", $InstallerPath, "/quiet", "/norestart" -Wait -PassThru
+            if ($proc.ExitCode -ne 0) {
+              throw "Tailscale MSI exited with code $($proc.ExitCode)"
+            }
           } -ArgumentList $installer | Out-Null
-          
-          $env:PATH += ";C:\Program Files\Tailscale"
-          echo "C:\Program Files\Tailscale" >> $env:GITHUB_PATH
+
+          $tailscaleExe = Get-ChildItem -Path "C:\Program Files", "C:\Program Files (x86)" -Filter "tailscale.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($tailscaleExe) {
+            $env:PATH += ";$($tailscaleExe.DirectoryName)"
+            echo $tailscaleExe.DirectoryName >> $env:GITHUB_PATH
+            Write-Host "Tailscale installed at $($tailscaleExe.FullName)"
+          } else {
+            throw "tailscale.exe not found after MSI install"
+          }
 
       - name: Connect to Tailscale
         shell: pwsh
@@ -141,16 +150,7 @@ jobs:
           $hostname = "gh-rdp-$sessionId"
           $tailscaleExe = (Get-Command tailscale.exe -ErrorAction SilentlyContinue).Source
           if (-not $tailscaleExe) {
-            $candidates = @(
-              "C:\Program Files\Tailscale\tailscale.exe",
-              "C:\Program Files\Tailscale IPN\tailscale.exe"
-            )
-            foreach ($candidate in $candidates) {
-              if (Test-Path $candidate) {
-                $tailscaleExe = $candidate
-                break
-              }
-            }
+            $tailscaleExe = Get-ChildItem -Path "C:\Program Files", "C:\Program Files (x86)" -Filter "tailscale.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object { $_.FullName }
           }
           if (-not $tailscaleExe) {
             throw "tailscale.exe not found after install"
@@ -704,16 +704,7 @@ jobs:
         run: |
           $tailscaleExe = (Get-Command tailscale.exe -ErrorAction SilentlyContinue).Source
           if (-not $tailscaleExe) {
-            $candidates = @(
-              "C:\Program Files\Tailscale\tailscale.exe",
-              "C:\Program Files\Tailscale IPN\tailscale.exe"
-            )
-            foreach ($candidate in $candidates) {
-              if (Test-Path $candidate) {
-                $tailscaleExe = $candidate
-                break
-              }
-            }
+            $tailscaleExe = Get-ChildItem -Path "C:\Program Files", "C:\Program Files (x86)" -Filter "tailscale.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object { $_.FullName }
           }
           if (-not $tailscaleExe) {
             throw "tailscale.exe not found when displaying connection info"
