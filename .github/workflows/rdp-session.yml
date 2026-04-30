@@ -24,7 +24,7 @@ env:
 
 jobs:
   rdp-session:
-    
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -631,52 +631,6 @@ jobs:
             }
           }
 
-      - name: Start OpenClaw managed browser
-        shell: pwsh
-        run: |
-          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
-          $env:NPM_CONFIG_PREFIX = "$rdpUserHome\.npm-global"
-          $env:PATH = "$rdpUserHome\.npm-global;$env:PATH"
-          
-          # Wait for gateway to be ready
-          Write-Host "Waiting for OpenClaw gateway to be ready..."
-          # Keep startup snappy: only give the gateway a short head start.
-          $maxWait = 30
-          $waited = 0
-          while ($waited -lt $maxWait) {
-            try {
-              $resp = Invoke-WebRequest -Uri "http://127.0.0.1:18789/" -UseBasicParsing -TimeoutSec 2 -ErrorAction SilentlyContinue
-              if ($resp.StatusCode -eq 200 -or $resp.StatusCode -eq 401) {
-                Write-Host "Gateway is ready"
-                break
-              }
-            } catch {}
-            Start-Sleep -Seconds 2
-            $waited += 2
-          }
-          
-          Write-Host "Starting OpenClaw managed browser (headless, no-sandbox)..."
-          
-          # Use new headless mode (harder to detect than legacy headless)
-          $env:PLAYWRIGHT_CHROMIUM_USE_HEADLESS_NEW = "1"
-          
-          # Start the openclaw browser (flag goes BEFORE subcommand per docs)
-          # Try with --browser-profile first, fall back to default if not supported
-          $startOutput = openclaw browser --browser-profile openclaw start 2>&1 | Out-String
-          $startExitCode = $LASTEXITCODE
-          $global:LASTEXITCODE = 0
-          if ($startOutput -match "unknown option") {
-            Write-Host "WARNING: --browser-profile not supported, trying without profile flag..."
-            $startOutput = openclaw browser start 2>&1 | Out-String
-            $startExitCode = $LASTEXITCODE
-            $global:LASTEXITCODE = 0
-          }
-          Write-Host "Browser start output: $startOutput"
-          if ($startExitCode -ne 0 -and $startOutput -match "gateway timeout") {
-            Write-Host "WARNING: Browser start timed out but will be treated as non-fatal"
-          }
-          Start-Sleep -Seconds 2
-          Write-Host "OpenClaw browser start requested; skipping CDP verification for faster startup"
           $global:LASTEXITCODE = 0
         continue-on-error: true
 
@@ -1023,77 +977,7 @@ jobs:
               }
             }
 
-            if ($gatewayUp) {
-              # Check if OpenClaw managed browser CDP is still reachable
-              try {
-                $cdpCheck = Invoke-WebRequest -Uri "http://127.0.0.1:18800/json/version" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
-                # Browser is reachable, reset fail counter
-                if ((Test-Path variable:script:browserFailCount) -and $script:browserFailCount -gt 0) {
-                  Write-Host "  Browser CDP confirmed reachable (reset fail counter from $($script:browserFailCount))"
-                }
-                $script:browserFailCount = 0
-              } catch {
-                if (-not (Test-Path variable:script:browserFailCount)) { $script:browserFailCount = 0 }
-                $script:browserFailCount++
-                
-                if ($script:browserFailCount -le 3) {
-                  Write-Host "  WARNING: Browser CDP not reachable on port 18800 (attempt $($script:browserFailCount)/3), attempting restart..."
-                  
-                  # Try via gateway HTTP API (works regardless of which user the keepalive runs as)
-                  $restarted = $false
-                  try {
-                    $startResp = Invoke-WebRequest -Uri "http://127.0.0.1:18789/browser/start?profile=openclaw" `
-                      -Method POST -UseBasicParsing -TimeoutSec 10 `
-                      -Headers @{ "Authorization" = "Bearer openclaw" } `
-                      -ErrorAction Stop
-                    if ($startResp.StatusCode -eq 200) {
-                      Start-Sleep -Seconds 8
-                      try {
-                        Invoke-WebRequest -Uri "http://127.0.0.1:18800/json/version" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop | Out-Null
-                        Write-Host "  Browser restarted successfully via gateway API"
-                        $restarted = $true
-                        $script:browserFailCount = 0
-                      } catch {
-                        Write-Host "  Gateway accepted start request but CDP still not reachable"
-                      }
-                    }
-                  } catch {
-                    Write-Host "  Gateway API start request failed: $($_.Exception.Message)"
-                  }
-                  
-                  # Fallback: try CLI as rdpuser via scheduled task
-                  if (-not $restarted) {
-                    $taskScript = "$rdpUserHome\start-browser.ps1"
-          $scriptLines = @(
-            ('$env:PATH = "' + $rdpUserHome + '\.npm-global;" + $env:PATH'),
-            '$env:PLAYWRIGHT_CHROMIUM_USE_HEADLESS_NEW = "1"',
-            'openclaw browser --browser-profile openclaw start 2>&1 | Out-Null'
-          )
-                    $scriptLines -join "`r`n" | Out-File -FilePath $taskScript -Encoding UTF8 -Force
-                    $batchWrapper = "$rdpUserHome\start-browser.bat"
-                    $batchLines = '@echo off', ('powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $taskScript + '"')
-                    $batchLines -join "`r`n" | Out-File -FilePath $batchWrapper -Encoding ASCII -Force
-                    
-                    schtasks /Create /TN "OpenClawBrowserRestart" /TR $batchWrapper /SC ONCE /ST 00:00 /RU "rdpuser" /RP $env:RDP_PASSWORD /RL HIGHEST /F 2>$null
-                    schtasks /Run /TN "OpenClawBrowserRestart" 2>$null
-                    Start-Sleep -Seconds 8
-                    
-                    try {
-                      Invoke-WebRequest -Uri "http://127.0.0.1:18800/json/version" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop | Out-Null
-                      Write-Host "  Browser restarted successfully via scheduled task"
-                      $script:browserFailCount = 0
-                    } catch {
-                      Write-Host "  WARNING: Browser restart via scheduled task also failed"
-                    }
-                  }
-                } elseif ($script:browserFailCount -eq 4) {
-                  Write-Host "  Browser CDP failed 3 restart attempts - giving up automatic restarts."
-                  Write-Host "  The gateway will auto-start the browser on the next browser tool call."
-                  Write-Host "  Or RDP in and run: openclaw browser --browser-profile openclaw start"
-                }
-                # After giving up, stay silent (no spam every 60s)
-              }
-            }
+            # Browser/CDP recovery removed for leaner keepalive
             
             # Periodic secret save
             $sinceLastSave = ((Get-Date) - $lastSaveTime).TotalMinutes
