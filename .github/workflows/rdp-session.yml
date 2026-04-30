@@ -780,13 +780,9 @@ jobs:
           # Helper: save secrets to GitHub
           function Save-Secrets {
             $configFile = "$rdpUserHome\.openclaw\openclaw.json"
-            $authFile = "$rdpUserHome\.openclaw\agents\main\agent\auth-profiles.json"
             try {
               if (Test-Path $configFile) {
                 Get-Content $configFile -Raw | gh secret set OPENCLAW_CONFIG --repo $repo 2>&1 | Out-Null
-              }
-              if (Test-Path $authFile) {
-                Get-Content $authFile -Raw | gh secret set OPENCLAW_AUTH_PROFILES --repo $repo 2>&1 | Out-Null
               }
               Write-Host "  [SAVE] Secrets saved at $(Get-Date -Format 'HH:mm:ss')"
             } catch {
@@ -974,15 +970,11 @@ jobs:
           $rdpUserHome = "C:\Users\rdpuser"
           $repo = "${{ github.repository }}"
           $configFile = "$rdpUserHome\.openclaw\openclaw.json"
-          $authFile = "$rdpUserHome\.openclaw\agents\main\agent\auth-profiles.json"
           
           Write-Host "Fallback secret save (in case keepalive was interrupted)..."
           try {
             if (Test-Path $configFile) {
               Get-Content $configFile -Raw | gh secret set OPENCLAW_CONFIG --repo $repo
-            }
-            if (Test-Path $authFile) {
-              Get-Content $authFile -Raw | gh secret set OPENCLAW_AUTH_PROFILES --repo $repo
             }
             Write-Host "Secrets saved"
           } catch {
