@@ -375,44 +375,11 @@ jobs:
             Write-Host "  SKIP: Chrome already installed"
           }
           
-          # Brave: install for extension relay browser (headed mode via RDP)
-          $braveCandidates = @(
-            "C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
-            "C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
-            "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe",
-            "C:\Users\rdpuser\AppData\Local\BraveSoftware\Brave-Browser\Application\brave.exe"
-          )
-          $braveFound = $braveCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $braveFound) {
-            Write-Host "  INSTALL: Brave"
-            choco install -y brave --no-progress 2>&1 | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-              Write-Host "  Chocolatey failed for Brave, trying direct download..."
-              $braveInstaller = "$env:TEMP\brave-setup.exe"
-              try {
-                (New-Object System.Net.WebClient).DownloadFile("https://laptop-updates.brave.com/latest/winx64", $braveInstaller)
-                Start-Process -FilePath $braveInstaller -ArgumentList "/silent /install" -Wait -NoNewWindow
-                Write-Host "  OK: Brave installed via direct download"
-                Remove-Item $braveInstaller -Force -ErrorAction SilentlyContinue
-              } catch {
-                Write-Host "  WARNING: Brave direct download also failed - $_"
-              }
-            } else {
-              Write-Host "  OK: Brave installed via Chocolatey"
-            }
-          } else {
-            Write-Host "  SKIP: Brave already installed at $braveFound"
-          }
           
           # Install uBlock Origin for Chrome via policy
           $chromeExtPath = "HKLM:\SOFTWARE\Policies\Google\Chrome\ExtensionInstallForcelist"
           New-Item -Path $chromeExtPath -Force | Out-Null
           Set-ItemProperty -Path $chromeExtPath -Name "1" -Value "cjpalhdlnbpafiamejdnhcphjbkeiagm;https://clients2.google.com/service/update2/crx"
-          
-          # Install uBlock Origin for Brave via policy
-          $braveExtPath = "HKLM:\SOFTWARE\Policies\BraveSoftware\Brave\ExtensionInstallForcelist"
-          New-Item -Path $braveExtPath -Force | Out-Null
-          Set-ItemProperty -Path $braveExtPath -Name "1" -Value "cjpalhdlnbpafiamejdnhcphjbkeiagm;https://clients2.google.com/service/update2/crx"
           
           # Install uBlock Origin for Firefox via policy
           $firefoxExtPath = "HKLM:\SOFTWARE\Policies\Mozilla\Firefox\Extensions\Install"
@@ -550,6 +517,40 @@ jobs:
           $null = cmd /c "icacls `"$openclawDir`" /grant rdpuser:(OI)(CI)F /T /Q 2>&1"
           $global:LASTEXITCODE = 0
           Write-Host "OpenClaw configured"
+
+      - name: Start OpenClaw gateway (early)
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
+          $password = $env:RDP_PASSWORD
+          
+          # Create startup script (with stderr capture for crash diagnosis)
+          $scriptContent = '$env:PATH = "C:\Users\rdpuser\.npm-global;" + $env:PATH' + "`r`n"
+          $scriptContent += '$env:PLAYWRIGHT_CHROMIUM_USE_HEADLESS_NEW = "1"' + "`r`n"
+          $scriptContent += '$env:PLAYWRIGHT_BROWSERS_PATH = "C:\Users\rdpuser\.playwright-browsers"' + "`r`n"
+          $scriptContent += '$logFile = "C:\Users\rdpuser\.openclaw\gateway-crash.log"' + "`r`n"
+          $scriptContent += 'Start-Process -WindowStyle Hidden -FilePath "node" -ArgumentList "C:\Users\rdpuser\.npm-global\node_modules\openclaw\openclaw.mjs", "gateway" -WorkingDirectory "C:\Users\rdpuser\.openclaw" -RedirectStandardError $logFile'
+          $scriptPath = "$rdpUserHome\start-openclaw.ps1"
+          $scriptContent | Out-File -FilePath $scriptPath -Encoding UTF8
+          
+          # Create batch wrapper
+          $batchContent = '@echo off' + "`r`n"
+          $batchContent += 'powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\Users\rdpuser\start-openclaw.ps1"'
+          $batchPath = "$rdpUserHome\start-openclaw.bat"
+          $batchContent | Out-File -FilePath $batchPath -Encoding ASCII
+          
+          # Create scheduled task using schtasks.exe (runs at system startup as rdpuser)
+          $taskName = "OpenClawGateway"
+          schtasks /Create /TN $taskName /TR $batchPath /SC ONSTART /RU "rdpuser" /RP $password /RL HIGHEST /F
+          
+          if ($LASTEXITCODE -eq 0) {
+            schtasks /Run /TN $taskName
+            Write-Host "OpenClaw gateway scheduled task created and started"
+          } else {
+            Write-Host "WARNING: Could not create scheduled task"
+          }
           
       # ========== PATCH OPENCLAW ==========
       - name: Patch OpenClaw (Antigravity models + endpoints)
@@ -563,165 +564,6 @@ jobs:
             Write-Host "WARNING: patch-windows.ps1 not found in repo root -- skipping patching"
           }
 
-      # ========== BROWSER SETUP ==========
-      - name: Install Playwright and Chromium for browser control
-        shell: pwsh
-        run: |
-          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
-          $env:NPM_CONFIG_PREFIX = "$rdpUserHome\.npm-global"
-          $env:PATH = "$rdpUserHome\.npm-global;$env:PATH"
-          
-          # Use a stable, cacheable path for Playwright browsers
-          $browsersPath = "$rdpUserHome\.playwright-browsers"
-          $env:PLAYWRIGHT_BROWSERS_PATH = $browsersPath
-          
-          # Install Playwright npm package (covered by npm-global cache)
-          $pwBin = "$rdpUserHome\.npm-global\node_modules\playwright\cli.js"
-          if (-not (Test-Path $pwBin)) {
-            Write-Host "Installing Playwright npm package..."
-            npm install -g playwright
-          } else {
-            Write-Host "Playwright npm package already present (cached)"
-          }
-          
-          # Install Chromium browser binary (covered by playwright-browsers cache)
-          if ("${{ steps.cache-playwright.outputs.cache-hit }}" -eq "true") {
-            # Validate the cached browser is actually usable
-            $chromiumDirs = Get-ChildItem -Path $browsersPath -Directory -Filter "chromium-*" -ErrorAction SilentlyContinue
-            if ($chromiumDirs) {
-              Write-Host "Playwright Chromium restored from cache: $($chromiumDirs[0].Name)"
-            } else {
-              Write-Host "WARNING: Cache hit but no chromium directory found, reinstalling..."
-              npx playwright install --with-deps chromium
-            }
-          } else {
-            Write-Host "Installing Playwright Chromium browser..."
-            npx playwright install --with-deps chromium
-          }
-          
-          # Grant rdpuser access to browser binaries
-          $null = cmd /c "icacls `"$browsersPath`" /grant rdpuser:(OI)(CI)F /T /Q 2>&1"
-          $global:LASTEXITCODE = 0
-          
-          Write-Host "Playwright + Chromium ready at: $browsersPath"
-        continue-on-error: true
-
-      - name: Install OpenClaw browser extension for Brave
-        shell: pwsh
-        run: |
-          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
-          $env:NPM_CONFIG_PREFIX = "$rdpUserHome\.npm-global"
-          $env:PATH = "$rdpUserHome\.npm-global;$env:PATH"
-          
-          # Point openclaw at rdpuser's state dir so the extension installs there
-          $env:OPENCLAW_STATE_DIR = "$rdpUserHome\.openclaw"
-          
-          # Install the extension files
-          Write-Host "Installing OpenClaw browser extension..."
-          
-          # Check openclaw version and browser command availability
-          $ocVersion = openclaw --version 2>&1 | Out-String
-          Write-Host "OpenClaw version: $ocVersion"
-          
-          $browserHelp = openclaw browser --help 2>&1 | Out-String
-          Write-Host "Browser command help:`n$browserHelp"
-          
-          # The extension subcommand may have different syntax depending on version
-          # Try 'openclaw browser extension' first (it may auto-install or show subcommands)
-          $installOutput = openclaw browser extension 2>&1 | Out-String
-          Write-Host "Extension output: $installOutput"
-          
-          # Check all possible locations for the extension directory
-          $candidates = @(
-            "$rdpUserHome\.openclaw\browser\chrome-extension",
-            "$env:USERPROFILE\.openclaw\browser\chrome-extension",
-            "C:\Users\runneradmin\.openclaw\browser\chrome-extension"
-          )
-          
-          $extPath = $null
-          foreach ($candidate in $candidates) {
-            if (Test-Path $candidate) {
-              $extPath = $candidate
-              break
-            }
-          }
-          
-          # If found under runner's home but not rdpuser's, copy it over
-          if ($extPath -and $extPath -ne $candidates[0]) {
-            Write-Host "Extension found at $extPath, copying to rdpuser..."
-            $targetDir = "$rdpUserHome\.openclaw\browser\chrome-extension"
-            New-Item -ItemType Directory -Path (Split-Path $targetDir) -Force | Out-Null
-            Copy-Item -Path $extPath -Destination $targetDir -Recurse -Force
-            $extPath = $targetDir
-          }
-          
-          Write-Host "Extension path resolved to: $extPath"
-          
-          if (-not $extPath -or -not (Test-Path $extPath)) {
-            Write-Host "WARNING: Extension path not found, skipping Brave extension setup"
-            exit 0
-          }
-          
-          # Grant rdpuser access to extension files
-          $null = cmd /c "icacls `"$extPath`" /grant rdpuser:(OI)(CI)R /T /Q 2>&1"
-          $global:LASTEXITCODE = 0
-          
-          # For unpacked extensions loaded via --load-extension, we don't need
-          # registry-based installation. Instead, we configure Brave to launch
-          # with --load-extension pointing to the extension directory.
-          $braveCandidates = @(
-            "C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
-            "C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
-            "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe",
-            "C:\Users\rdpuser\AppData\Local\BraveSoftware\Brave-Browser\Application\brave.exe"
-          )
-          $bravePath = $braveCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $bravePath) {
-            Write-Host "WARNING: Brave not found in any of these locations:"
-            $braveCandidates | ForEach-Object { Write-Host "  - $_" }
-            exit 0
-          }
-          Write-Host "Brave found at: $bravePath"
-          
-          # Create Brave profile directory for openclaw relay usage
-          $braveProfileDir = "$rdpUserHome\AppData\Local\BraveSoftware\Brave-Browser\User Data\OpenClaw"
-          New-Item -ItemType Directory -Path $braveProfileDir -Force | Out-Null
-          
-          # Create a desktop shortcut for manual (re)launch
-          $launchLines = @(
-            '@echo off',
-            'REM Launch Brave with OpenClaw extension pre-loaded',
-            'REM One-time: click extension icon then Options then set Gateway Token to openclaw',
-            "start `"`" `"$bravePath`" --load-extension=`"$extPath`" --profile-directory=`"OpenClaw`" --no-first-run --no-default-browser-check"
-          )
-          $launchScript = $launchLines -join "`r`n"
-          $launchScriptPath = "$rdpUserHome\Desktop\Brave-OpenClaw.bat"
-          [System.IO.File]::WriteAllText($launchScriptPath, $launchScript, [System.Text.Encoding]::ASCII)
-          
-          $null = cmd /c "icacls `"$rdpUserHome\Desktop`" /grant rdpuser:(OI)(CI)F /T /Q 2>&1"
-          $global:LASTEXITCODE = 0
-          
-          # Launch Brave now as rdpuser via scheduled task (Startup folder unreliable in GH Actions RDP)
-          $taskName = "BraveOpenClaw"
-          $batchPath = "$rdpUserHome\start-brave-openclaw.bat"
-          $batchContent = $launchLines -join "`r`n"
-          [System.IO.File]::WriteAllText($batchPath, $batchContent, [System.Text.Encoding]::ASCII)
-          
-          $password = "${{ secrets.RDP_PASSWORD }}"
-          schtasks /Create /TN $taskName /TR $batchPath /SC ONLOGON /RU "rdpuser" /RP $password /RL HIGHEST /F /IT
-          if ($LASTEXITCODE -eq 0) {
-            schtasks /Run /TN $taskName
-            Write-Host "Brave launched via scheduled task with extension loaded"
-          } else {
-            Write-Host "WARNING: Could not create Brave scheduled task, use Desktop shortcut manually"
-          }
-          
-          Write-Host "Brave-OpenClaw setup complete"
-          Write-Host "  Extension path: $extPath"
-          Write-Host "  Brave profile: OpenClaw"
-          Write-Host "  Desktop shortcut: Brave-OpenClaw.bat"
-          Write-Host "  One-time setup: click extension icon > Options > set token to 'openclaw'"
-        continue-on-error: true
 
       - name: Find previous workspace artifact
         id: find-artifact
@@ -771,114 +613,6 @@ jobs:
           run-id: ${{ steps.find-artifact.outputs.RUN_ID }}
         continue-on-error: true
 
-      - name: Start OpenClaw gateway
-        shell: pwsh
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
-          $password = $env:RDP_PASSWORD
-          
-          # Create startup script (with stderr capture for crash diagnosis)
-          $scriptContent = '$env:PATH = "C:\Users\rdpuser\.npm-global;" + $env:PATH' + "`r`n"
-          $scriptContent += '$env:PLAYWRIGHT_CHROMIUM_USE_HEADLESS_NEW = "1"' + "`r`n"
-          $scriptContent += '$env:PLAYWRIGHT_BROWSERS_PATH = "C:\Users\rdpuser\.playwright-browsers"' + "`r`n"
-          $scriptContent += '$logFile = "C:\Users\rdpuser\.openclaw\gateway-crash.log"' + "`r`n"
-          $scriptContent += 'Start-Process -WindowStyle Hidden -FilePath "node" -ArgumentList "C:\Users\rdpuser\.npm-global\node_modules\openclaw\openclaw.mjs", "gateway" -WorkingDirectory "C:\Users\rdpuser\.openclaw" -RedirectStandardError $logFile'
-          $scriptPath = "$rdpUserHome\start-openclaw.ps1"
-          $scriptContent | Out-File -FilePath $scriptPath -Encoding UTF8
-          
-          # Create batch wrapper
-          $batchContent = '@echo off' + "`r`n"
-          $batchContent += 'powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\Users\rdpuser\start-openclaw.ps1"'
-          $batchPath = "$rdpUserHome\start-openclaw.bat"
-          $batchContent | Out-File -FilePath $batchPath -Encoding ASCII
-          
-          # Create scheduled task using schtasks.exe (runs at system startup as rdpuser)
-          $taskName = "OpenClawGateway"
-          schtasks /Create /TN $taskName /TR $batchPath /SC ONSTART /RU "rdpuser" /RP $password /RL HIGHEST /F
-          
-          if ($LASTEXITCODE -eq 0) {
-            schtasks /Run /TN $taskName
-            Write-Host "OpenClaw gateway scheduled task created and started"
-          } else {
-            Write-Host "WARNING: Could not create scheduled task"
-          }
-
-      - name: Start OpenClaw managed browser
-        shell: pwsh
-        run: |
-          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
-          $env:NPM_CONFIG_PREFIX = "$rdpUserHome\.npm-global"
-          $env:PATH = "$rdpUserHome\.npm-global;$env:PATH"
-          $env:PLAYWRIGHT_BROWSERS_PATH = "$rdpUserHome\.playwright-browsers"
-          
-          # Wait for gateway to be ready
-          Write-Host "Waiting for OpenClaw gateway to be ready..."
-          $maxWait = 30
-          $waited = 0
-          while ($waited -lt $maxWait) {
-            try {
-              $resp = Invoke-WebRequest -Uri "http://127.0.0.1:18789/" -UseBasicParsing -TimeoutSec 2 -ErrorAction SilentlyContinue
-              if ($resp.StatusCode -eq 200 -or $resp.StatusCode -eq 401) {
-                Write-Host "Gateway is ready"
-                break
-              }
-            } catch {}
-            Start-Sleep -Seconds 2
-            $waited += 2
-          }
-          
-          Write-Host "Starting OpenClaw managed browser (headless, no-sandbox)..."
-          
-          # Use new headless mode (harder to detect than legacy headless)
-          $env:PLAYWRIGHT_CHROMIUM_USE_HEADLESS_NEW = "1"
-          
-          # Start the openclaw browser (flag goes BEFORE subcommand per docs)
-          # Try with --browser-profile first, fall back to default if not supported
-          $startOutput = openclaw browser --browser-profile openclaw start 2>&1 | Out-String
-          if ($startOutput -match "unknown option") {
-            Write-Host "WARNING: --browser-profile not supported, trying without profile flag..."
-            $startOutput = openclaw browser start 2>&1 | Out-String
-          }
-          Write-Host "Browser start output: $startOutput"
-          Start-Sleep -Seconds 5
-          
-          # Check browser status
-          $browserStatus = openclaw browser --browser-profile openclaw status 2>&1 | Out-String
-          if ($browserStatus -match "unknown option") {
-            $browserStatus = openclaw browser status 2>&1 | Out-String
-          }
-          Write-Host "Browser status: $browserStatus"
-          
-          # Verify CDP is reachable on the configured port
-          try {
-            $cdpCheck = Invoke-WebRequest -Uri "http://127.0.0.1:18800/json/version" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
-            Write-Host "Browser CDP endpoint is reachable on port 18800"
-            
-            # Apply stealth: set realistic user-agent via browser control API
-            $gatewayPort = 18789
-            $ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-            $body = @{ headers = @{ "User-Agent" = $ua } } | ConvertTo-Json -Compress
-            try {
-              Invoke-WebRequest -Uri "http://127.0.0.1:$gatewayPort/browser/set/headers?profile=openclaw" `
-                -Method POST -UseBasicParsing -TimeoutSec 5 `
-                -Headers @{ "Authorization" = "Bearer openclaw"; "Content-Type" = "application/json" } `
-                -Body $body -ErrorAction Stop | Out-Null
-              Write-Host "Stealth: User-Agent set"
-            } catch {
-              Write-Host "WARNING: Could not set User-Agent (non-critical)"
-            }
-            
-            # Apply stealth: set realistic locale and timezone
-            openclaw browser --browser-profile openclaw set locale en-US 2>$null
-            openclaw browser --browser-profile openclaw set timezone America/New_York 2>$null
-            Write-Host "Stealth: locale=en-US, timezone=America/New_York"
-          } catch {
-            Write-Host "WARNING: Browser CDP endpoint not reachable yet (gateway may auto-start it on first use)"
-          }
-        continue-on-error: true
-
       - name: Display Connection Info
         shell: pwsh
         run: |
@@ -911,18 +645,6 @@ jobs:
           Write-Host "  Start: openclaw gateway"
           Write-Host "  Cache version: ${{ steps.session.outputs.OPENCLAW_CACHE_VERSION }}"
           Write-Host ""
-          Write-Host "Browser (openclaw-managed, headless):"
-          Write-Host "  Profile:   openclaw"
-          Write-Host "  CDP Port:  18800"
-          Write-Host "  Headless:  true"
-          Write-Host "  Sandbox:   disabled (CI environment)"
-          Write-Host ""
-          Write-Host "Browser (Brave extension relay, headed):"
-          Write-Host "  Profile:   chrome (built-in)"
-          Write-Host "  Launcher:  $rdpUserHome\Desktop\Brave-OpenClaw.bat"
-          Write-Host "  Auto-start: on RDP login via Startup folder"
-          Write-Host "  One-time:  click extension icon > Options > set token to 'openclaw'"
-          Write-Host ""
           Write-Host "Upgrade openclaw:"
           Write-Host "  Cancel this workflow from GitHub Actions UI"
           Write-Host "  (auto-saves workspace, toggles cache version, triggers new session)"
@@ -933,6 +655,70 @@ jobs:
           Write-Host ""
           Write-Host "Session will auto-chain at ~${{ env.CHAIN_TRIGGER_MINUTES }} minutes"
           Write-Host "=============================================="
+
+      # ========== BROWSER SETUP ==========
+      - name: Install Playwright and Chromium for browser control
+        shell: pwsh
+        run: |
+          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
+          $env:NPM_CONFIG_PREFIX = "$rdpUserHome\.npm-global"
+          $env:PATH = "$rdpUserHome\.npm-global;$env:PATH"
+          
+          # Use a stable, cacheable path for Playwright browsers
+          $browsersPath = "$rdpUserHome\.playwright-browsers"
+          $env:PLAYWRIGHT_BROWSERS_PATH = $browsersPath
+          
+          # Install Playwright npm package (covered by npm-global cache)
+          $pwBin = "$rdpUserHome\.npm-global\node_modules\playwright\cli.js"
+          if (-not (Test-Path $pwBin)) {
+            Write-Host "Installing Playwright npm package..."
+            npm install -g playwright
+          } else {
+            Write-Host "Playwright npm package already present (cached)"
+          }
+          
+          # Install Chromium browser binary (covered by playwright-browsers cache)
+          if ("${{ steps.cache-playwright.outputs.cache-hit }}" -eq "true") {
+            # Validate the cached browser is actually usable
+            $chromiumDirs = Get-ChildItem -Path $browsersPath -Directory -Filter "chromium-*" -ErrorAction SilentlyContinue
+            if ($chromiumDirs) {
+              Write-Host "Playwright Chromium restored from cache: $($chromiumDirs[0].Name)"
+            } else {
+              Write-Host "WARNING: Cache hit but no chromium directory found, reinstalling..."
+              npx playwright install --with-deps chromium
+            }
+          } else {
+            Write-Host "Installing Playwright Chromium browser..."
+            npx playwright install --with-deps chromium
+          }
+          
+          # Grant rdpuser access to browser binaries
+          $null = cmd /c "icacls `"$browsersPath`" /grant rdpuser:(OI)(CI)F /T /Q 2>&1"
+          $global:LASTEXITCODE = 0
+          
+          Write-Host "Playwright + Chromium ready at: $browsersPath"
+        continue-on-error: true
+
+      - name: Start OpenClaw managed browser (best-effort)
+        shell: pwsh
+        run: |
+          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
+          $env:NPM_CONFIG_PREFIX = "$rdpUserHome\.npm-global"
+          $env:PATH = "$rdpUserHome\.npm-global;$env:PATH"
+          $env:PLAYWRIGHT_BROWSERS_PATH = "$rdpUserHome\.playwright-browsers"
+          
+          Write-Host "Starting OpenClaw managed browser (headless, no-sandbox)..."
+          $env:PLAYWRIGHT_CHROMIUM_USE_HEADLESS_NEW = "1"
+          
+          # Start the openclaw browser (flag goes BEFORE subcommand per docs)
+          # Try with --browser-profile first, fall back to default if not supported
+          $startOutput = openclaw browser --browser-profile openclaw start 2>&1 | Out-String
+          if ($startOutput -match "unknown option") {
+            Write-Host "WARNING: --browser-profile not supported, trying without profile flag..."
+            $startOutput = openclaw browser start 2>&1 | Out-String
+          }
+          Write-Host "Browser start output: $startOutput"
+        continue-on-error: true
 
       - name: Keep session alive (phase 1 - until chain trigger)
         id: keepalive
