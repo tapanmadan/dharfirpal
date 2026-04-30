@@ -24,7 +24,7 @@ env:
 
 jobs:
   rdp-session:
-    
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -512,17 +512,6 @@ jobs:
                 Write-Host "  Config sanitized (removed unrecognized keys)"
               }
 
-              # Remove stale plugin entries that are no longer supported by OpenClaw
-              if ($configObj.plugins -and $configObj.plugins.entries) {
-                $entries = @($configObj.plugins.entries)
-                $filteredEntries = @($entries | Where-Object { $_.name -ne "google-antigravity-auth" })
-                if ($filteredEntries.Count -ne $entries.Count) {
-                  Write-Host "  Removing stale plugin entry: google-antigravity-auth"
-                  $configObj.plugins.entries = $filteredEntries
-                  $config = $configObj | ConvertTo-Json -Depth 20
-                }
-              }
-              
               # Ensure browser plugin is enabled (required for 'openclaw browser' CLI)
               # If plugins.allow exists, 'browser' must be in the list
               if ($configObj.plugins -and $configObj.plugins.allow) {
@@ -635,6 +624,25 @@ jobs:
           
           # First-run bootstrap: if cache miss, try to let OpenClaw create the extension once.
           if (-not $extPath -or -not (Test-Path $extPath)) {
+            # Ensure gateway is reachable before attempting bootstrap
+            $gatewayReady = $false
+            $maxWait = 20
+            $waited = 0
+            while ($waited -lt $maxWait) {
+              try {
+                $resp = Invoke-WebRequest -Uri "http://127.0.0.1:18789/" -UseBasicParsing -TimeoutSec 2 -ErrorAction SilentlyContinue
+                if ($resp.StatusCode -eq 200 -or $resp.StatusCode -eq 401) {
+                  $gatewayReady = $true
+                  break
+                }
+              } catch {}
+              Start-Sleep -Seconds 2
+              $waited += 2
+            }
+            if (-not $gatewayReady) {
+              Write-Host "WARNING: Gateway not reachable; skipping extension bootstrap"
+              exit 0
+            }
             Write-Host "Extension cache miss, attempting first-run bootstrap..."
             $bootstrapOutput = openclaw browser --browser-profile openclaw start 2>&1 | Out-String
             $bootstrapExitCode = $LASTEXITCODE
@@ -767,6 +775,7 @@ jobs:
         run: |
           $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
           $password = $env:RDP_PASSWORD
+          $gatewayUrl = "http://127.0.0.1:18789/"
           
           # Create startup script (with stderr capture for crash diagnosis)
           $scriptContent = '$env:PATH = "C:\Users\rdpuser\.npm-global;" + $env:PATH' + "`r`n"
@@ -782,16 +791,69 @@ jobs:
           $batchContent += 'powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\Users\rdpuser\start-openclaw.ps1"'
           $batchPath = "$rdpUserHome\start-openclaw.bat"
           $batchContent | Out-File -FilePath $batchPath -Encoding ASCII
-          
+           
           # Create scheduled task using schtasks.exe (runs at system startup as rdpuser)
           $taskName = "OpenClawGateway"
           schtasks /Create /TN $taskName /TR $batchPath /SC ONSTART /RU "rdpuser" /RP $password /RL HIGHEST /F
           
-          if ($LASTEXITCODE -eq 0) {
-            schtasks /Run /TN $taskName
-            Write-Host "OpenClaw gateway scheduled task created and started"
-          } else {
+           if ($LASTEXITCODE -eq 0) {
+             schtasks /Run /TN $taskName
+             Write-Host "OpenClaw gateway scheduled task created and started"
+           } else {
             Write-Host "WARNING: Could not create scheduled task"
+          }
+
+          # Direct start + retry loop before long wait
+          $logFile = "C:\Users\rdpuser\.openclaw\gateway-crash.log"
+          $nodePath = (Get-Command node -ErrorAction SilentlyContinue).Source
+          if (-not $nodePath) { $nodePath = "node" }
+          $gatewayStarted = $false
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            Write-Host "Gateway start attempt $attempt/3 (direct)"
+            Start-Process -WindowStyle Hidden -FilePath $nodePath -ArgumentList "C:\Users\rdpuser\.npm-global\node_modules\openclaw\openclaw.mjs", "gateway" -WorkingDirectory "C:\Users\rdpuser\.openclaw" -RedirectStandardError $logFile
+            $probeWait = 0
+            $probeMaxWait = 10
+            while ($probeWait -lt $probeMaxWait) {
+              try {
+                $resp = Invoke-WebRequest -Uri $gatewayUrl -UseBasicParsing -TimeoutSec 2 -ErrorAction SilentlyContinue
+                if ($resp.StatusCode -eq 200 -or $resp.StatusCode -eq 401) {
+                  $gatewayStarted = $true
+                  break
+                }
+              } catch {}
+              Start-Sleep -Seconds 2
+              $probeWait += 2
+            }
+            if ($gatewayStarted) { break }
+            schtasks /Run /TN $taskName | Out-Null
+            Start-Sleep -Seconds 2
+          }
+
+          # Wait for gateway readiness and surface crash logs if it fails
+          $maxWait = 40
+          $waited = 0
+          while ($waited -lt $maxWait) {
+            try {
+              $resp = Invoke-WebRequest -Uri $gatewayUrl -UseBasicParsing -TimeoutSec 2 -ErrorAction SilentlyContinue
+              if ($resp.StatusCode -eq 200 -or $resp.StatusCode -eq 401) {
+                Write-Host "Gateway is ready"
+                break
+              }
+            } catch {}
+            Start-Sleep -Seconds 2
+            $waited += 2
+          }
+
+          if ($waited -ge $maxWait) {
+            Write-Host "WARNING: Gateway not reachable after $maxWait seconds"
+            $crashLog = "C:\Users\rdpuser\.openclaw\gateway-crash.log"
+            if (Test-Path $crashLog) {
+              Write-Host "--- gateway-crash.log (tail) ---"
+              Get-Content -Path $crashLog -Tail 200
+              Write-Host "--- end gateway-crash.log ---"
+            } else {
+              Write-Host "No gateway crash log found at $crashLog"
+            }
           }
 
       - name: Start OpenClaw managed browser
@@ -805,7 +867,7 @@ jobs:
           # Wait for gateway to be ready
           Write-Host "Waiting for OpenClaw gateway to be ready..."
           # Keep startup snappy: only give the gateway a short head start.
-          $maxWait = 6
+          $maxWait = 30
           $waited = 0
           while ($waited -lt $maxWait) {
             try {
