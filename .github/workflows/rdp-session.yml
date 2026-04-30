@@ -15,24 +15,16 @@ on:
         description: 'Bump to force openclaw upgrade (e.g. v1 -> v2)'
         required: false
         default: 'v1'
-      chain_trigger_minutes:
-        description: 'Minutes from job start before chaining to the next session'
-        required: false
-        default: '335'
-      start_managed_browser:
-        description: 'Start OpenClaw managed browser during setup'
-        required: false
-        default: 'false'
   repository_dispatch:
     types: [chain-rdp]
 
 env:
-  CHAIN_TRIGGER_MINUTES: 335   # Fire chain dispatch at this many minutes from job start
+  CHAIN_TRIGGER_MINUTES: 345   # Fire chain dispatch at this many minutes from job start
   SAVE_INTERVAL_MINUTES: 60    # Periodic secret saves during keepalive
 
 jobs:
   rdp-session:
-    
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -74,22 +66,18 @@ jobs:
           }
           
           # Record job start time as ticks for accurate timeout calculation later
-          $chainTriggerMinutes = "${{ github.event.inputs.chain_trigger_minutes }}"
-          if ([string]::IsNullOrEmpty($chainTriggerMinutes)) {
-            $chainTriggerMinutes = 335
-          } else {
-            $chainTriggerMinutes = [int]$chainTriggerMinutes
-          }
-
           $jobStartTicks = (Get-Date).Ticks
           
           echo "SESSION_ID=$sessionId" >> $env:GITHUB_OUTPUT
           echo "CHAIN_COUNT=$chainCount" >> $env:GITHUB_OUTPUT
           echo "OPENCLAW_CACHE_VERSION=$openclawCacheVersion" >> $env:GITHUB_OUTPUT
-          echo "CHAIN_TRIGGER_MINUTES=$chainTriggerMinutes" >> $env:GITHUB_OUTPUT
           echo "JOB_START_TICKS=$jobStartTicks" >> $env:GITHUB_OUTPUT
-
-          Write-Host "Session: $sessionId | Chain: $chainCount | Cache: $openclawCacheVersion | Chain trigger: $chainTriggerMinutes"
+          $snapshotSourceRunId = "${{ github.event.client_payload.snapshot_source_run_id }}"
+          if (-not [string]::IsNullOrEmpty($snapshotSourceRunId)) {
+            echo "SNAPSHOT_SOURCE_RUN_ID=$snapshotSourceRunId" >> $env:GITHUB_OUTPUT
+          }
+          
+          Write-Host "Session: $sessionId | Chain: $chainCount | Cache: $openclawCacheVersion"
 
       # ========== DEPENDENCY CACHING ==========
       # NOTE: Chocolatey caching removed intentionally. windows-latest already has
@@ -112,17 +100,12 @@ jobs:
           path: C:\Users\rdpuser\.npm-global
           key: npm-global-openclaw-${{ steps.session.outputs.OPENCLAW_CACHE_VERSION }}-${{ runner.os }}
 
-      - name: Restore Playwright browsers cache
-        id: cache-playwright
-        uses: actions/cache/restore@v5
-        with:
-          path: C:\Users\rdpuser\.playwright-browsers
-          key: playwright-browsers-v1-${{ runner.os }}
 
       # ========== TAILSCALE SETUP ==========
       - name: Install Tailscale
         shell: pwsh
         run: |
+          . "$env:GITHUB_WORKSPACE\workflow-timeout.ps1"
           $cacheDir = "C:\tailscale-cache"
           $cachedMsi = "$cacheDir\tailscale-setup.msi"
           
@@ -134,10 +117,16 @@ jobs:
             New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
             $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
             $installer = $cachedMsi
-            Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
+            Invoke-WithTimeout -Activity "Downloading Tailscale" -TimeoutSeconds 900 -ScriptBlock {
+              param($DownloadUrl, $OutFile)
+              Invoke-WebRequest -Uri $DownloadUrl -OutFile $OutFile -UseBasicParsing
+            } -ArgumentList $url, $installer | Out-Null
           }
           
-          Start-Process msiexec.exe -ArgumentList "/i", $installer, "/quiet", "/norestart" -Wait
+          Invoke-WithTimeout -Activity "Installing Tailscale MSI" -TimeoutSeconds 900 -ScriptBlock {
+            param($InstallerPath)
+            Start-Process msiexec.exe -ArgumentList "/i", $InstallerPath, "/quiet", "/norestart" -Wait
+          } -ArgumentList $installer | Out-Null
           
           $env:PATH += ";C:\Program Files\Tailscale"
           echo "C:\Program Files\Tailscale" >> $env:GITHUB_PATH
@@ -147,17 +136,23 @@ jobs:
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
+          . "$env:GITHUB_WORKSPACE\workflow-timeout.ps1"
           $sessionId = "${{ steps.session.outputs.SESSION_ID }}"
           $hostname = "gh-rdp-$sessionId"
           
-          Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+          Invoke-WithTimeout -Activity "Starting Tailscale service" -TimeoutSeconds 120 -ScriptBlock {
+            Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+          } | Out-Null
           Start-Sleep -Seconds 5
           
-          & "C:\Program Files\Tailscale\tailscale.exe" up `
-            --authkey="$env:TAILSCALE_AUTHKEY" `
-            --hostname="$hostname" `
-            --accept-routes `
-            --accept-dns
+          Invoke-WithTimeout -Activity "Connecting Tailscale" -TimeoutSeconds 900 -ScriptBlock {
+            param($AuthKey, $HostName)
+            & "C:\Program Files\Tailscale\tailscale.exe" up `
+              --authkey="$AuthKey" `
+              --hostname="$HostName" `
+              --accept-routes `
+              --accept-dns
+          } -ArgumentList $env:TAILSCALE_AUTHKEY, $hostname | Out-Null
           
           Start-Sleep -Seconds 10
           
@@ -266,7 +261,6 @@ jobs:
           [Environment]::SetEnvironmentVariable("OPENCLAW_STATE_DIR", "$rdpUserHome\.openclaw", "Machine")
           [Environment]::SetEnvironmentVariable("OPENCLAW_WORKSPACE", "$rdpUserHome\.openclaw\workspace", "Machine")
           [Environment]::SetEnvironmentVariable("NPM_CONFIG_PREFIX", "$rdpUserHome\.npm-global", "Machine")
-          [Environment]::SetEnvironmentVariable("PLAYWRIGHT_BROWSERS_PATH", "$rdpUserHome\.playwright-browsers", "Machine")
           
           # Update PATH
           $currentPath = [Environment]::GetEnvironmentVariable("Path", "Machine")
@@ -342,69 +336,13 @@ jobs:
           }
           
           # VS Code
-          Install-Tool -Name "vscode" -ChocoPkg "vscode.install" `
-            -TestPath "C:\Program Files\Microsoft VS Code\Code.exe" `
-            -DirectUrl "https://update.code.visualstudio.com/latest/win32-x64/stable" `
-            -InstallerArgs "/verysilent /norestart /mergetasks=!runcode,addcontextmenufiles,addcontextmenufolders,addtopath" `
-            -InstallerType "exe"
-          
-          # Notepad++
-          Install-Tool -Name "notepad++" -ChocoPkg "notepadplusplus" `
-            -TestPath "C:\Program Files\Notepad++\notepad++.exe" `
-            -DirectUrl "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.7.6/npp.8.7.6.Installer.x64.exe" `
-            -InstallerArgs "/S" `
-            -InstallerType "exe"
-          
-          # Firefox (skip if already installed)
-          Install-Tool -Name "firefox" -ChocoPkg "firefox" `
-            -TestPath "C:\Program Files\Mozilla Firefox\firefox.exe" `
-            -DirectUrl "https://download.mozilla.org/?product=firefox-latest-ssl&os=win64&lang=en-US" `
-            -InstallerArgs "-ms" `
-            -InstallerType "exe"
-          
-          # Windows Terminal
-          Install-Tool -Name "terminal" -ChocoPkg "microsoft-windows-terminal" `
-            -TestPath "" `
-            -DirectUrl "" `
-            -InstallerArgs "" `
-            -InstallerType "exe"
-          
-          # Chrome: install separately with --ignore-checksums (Google updates faster than Chocolatey)
-          if (-not (Test-Path "C:\Program Files\Google\Chrome\Application\chrome.exe")) {
-            Write-Host "  INSTALL: Chrome"
-            choco install -y googlechrome --ignore-checksums --no-progress 2>&1 | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-              Write-Host "  Chocolatey failed for Chrome, trying direct download..."
-              $chromeInstaller = "$env:TEMP\chrome-setup.exe"
-              try {
-                (New-Object System.Net.WebClient).DownloadFile("https://dl.google.com/chrome/install/latest/chrome_installer.exe", $chromeInstaller)
-                Start-Process -FilePath $chromeInstaller -ArgumentList "/silent /install" -Wait -NoNewWindow
-                Write-Host "  OK: Chrome installed via direct download"
-                Remove-Item $chromeInstaller -Force -ErrorAction SilentlyContinue
-              } catch {
-                Write-Host "  WARNING: Chrome direct download also failed - $_"
-              }
-            } else {
-              Write-Host "  OK: Chrome installed via Chocolatey"
-            }
-          } else {
-            Write-Host "  SKIP: Chrome already installed"
-          }
-          
-          # Install uBlock Origin for Chrome via policy
-          $chromeExtPath = "HKLM:\SOFTWARE\Policies\Google\Chrome\ExtensionInstallForcelist"
-          New-Item -Path $chromeExtPath -Force | Out-Null
-          Set-ItemProperty -Path $chromeExtPath -Name "1" -Value "cjpalhdlnbpafiamejdnhcphjbkeiagm;https://clients2.google.com/service/update2/crx"
-          
-          # Install uBlock Origin for Firefox via policy
-          $firefoxExtPath = "HKLM:\SOFTWARE\Policies\Mozilla\Firefox\Extensions\Install"
-          New-Item -Path $firefoxExtPath -Force | Out-Null
-          Set-ItemProperty -Path $firefoxExtPath -Name "1" -Value "https://addons.mozilla.org/firefox/downloads/latest/ublock-origin/latest.xpi"
+          # Browser and editor installs removed for a leaner, faster startup
         continue-on-error: true
 
       - name: Install OpenClaw
         shell: pwsh
         run: |
+          . "$env:GITHUB_WORKSPACE\workflow-timeout.ps1"
           $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
           
           $env:NPM_CONFIG_PREFIX = "$rdpUserHome\.npm-global"
@@ -435,10 +373,23 @@ jobs:
             Write-Host "No npm cache hit (version: ${{ steps.session.outputs.OPENCLAW_CACHE_VERSION }})"
           }
           
-          if (-not $cacheWorking) {
-            Write-Host "Installing openclaw@latest fresh..."
-            npm install -g openclaw@latest
-          }
+            if (-not $cacheWorking) {
+              Write-Host "Installing openclaw@latest fresh..."
+              Invoke-WithTimeout -Activity "Installing openclaw@latest" -TimeoutSeconds 1800 -ScriptBlock {
+              Invoke-NativeChecked { npm install -g openclaw@latest }
+              }
+            }
+
+          # Ensure openclaw binary exists after install (fresh or cached)
+            if (-not (Test-Path $openclawBin)) {
+              Write-Host "WARNING: openclaw binary missing after install, forcing reinstall"
+              Invoke-WithTimeout -Activity "Uninstalling openclaw" -TimeoutSeconds 900 -ScriptBlock {
+              Invoke-NativeChecked { npm uninstall -g openclaw }
+              }
+              Invoke-WithTimeout -Activity "Reinstalling openclaw@latest" -TimeoutSeconds 1800 -ScriptBlock {
+              Invoke-NativeChecked { npm install -g openclaw@latest }
+              }
+            }
           
           $null = cmd /c "icacls `"$rdpUserHome\.npm-global`" /grant rdpuser:(OI)(CI)F /T /Q 2>&1"
           $global:LASTEXITCODE = 0
@@ -488,7 +439,7 @@ jobs:
                 $config = $configObj | ConvertTo-Json -Depth 20
                 Write-Host "  Config sanitized (removed unrecognized keys)"
               }
-              
+
               # Ensure browser plugin is enabled (required for 'openclaw browser' CLI)
               # If plugins.allow exists, 'browser' must be in the list
               if ($configObj.plugins -and $configObj.plugins.allow) {
@@ -509,6 +460,16 @@ jobs:
                 Write-Host "  Enabling browser in config"
                 $configObj.browser.enabled = $true
                 $config = $configObj | ConvertTo-Json -Depth 20
+              }
+
+              # Prefer Edge if browser executable not explicitly set
+              if (-not $configObj.browser.executablePath) {
+                $edgePath = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+                if (Test-Path $edgePath) {
+                  Write-Host "  Setting browser.executablePath to Edge"
+                  $configObj.browser.executablePath = $edgePath
+                  $config = $configObj | ConvertTo-Json -Depth 20
+                }
               }
             } catch {
               Write-Host "  WARNING: Config sanitization failed (will write as-is): $_"
@@ -533,107 +494,79 @@ jobs:
           $global:LASTEXITCODE = 0
           Write-Host "OpenClaw configured"
           
-      # ========== PATCH OPENCLAW ==========
-      - name: Patch OpenClaw (Antigravity models + endpoints)
-        shell: pwsh
-        run: |
-          $patchScript = Join-Path $env:GITHUB_WORKSPACE "patch-windows.ps1"
-          if (Test-Path $patchScript) {
-            Write-Host "Running OpenClaw patch script..."
-            & $patchScript
-          } else {
-            Write-Host "WARNING: patch-windows.ps1 not found in repo root -- skipping patching"
-          }
-
       # ========== BROWSER SETUP ==========
-      - name: Install Playwright and Chromium for browser control
-        shell: pwsh
-        run: |
-          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
-          $env:NPM_CONFIG_PREFIX = "$rdpUserHome\.npm-global"
-          $env:PATH = "$rdpUserHome\.npm-global;$env:PATH"
-          
-          # Use a stable, cacheable path for Playwright browsers
-          $browsersPath = "$rdpUserHome\.playwright-browsers"
-          $env:PLAYWRIGHT_BROWSERS_PATH = $browsersPath
-          
-          # Install Playwright npm package (covered by npm-global cache)
-          $pwBin = "$rdpUserHome\.npm-global\node_modules\playwright\cli.js"
-          if (-not (Test-Path $pwBin)) {
-            Write-Host "Installing Playwright npm package..."
-            npm install -g playwright
-          } else {
-            Write-Host "Playwright npm package already present (cached)"
-          }
-          
-          # Install Chromium browser binary (covered by playwright-browsers cache)
-          if ("${{ steps.cache-playwright.outputs.cache-hit }}" -eq "true") {
-            # Validate the cached browser is actually usable
-            $chromiumDirs = Get-ChildItem -Path $browsersPath -Directory -Filter "chromium-*" -ErrorAction SilentlyContinue
-            if ($chromiumDirs) {
-              Write-Host "Playwright Chromium restored from cache: $($chromiumDirs[0].Name)"
-            } else {
-              Write-Host "WARNING: Cache hit but no chromium directory found, reinstalling..."
-              npx playwright install --with-deps chromium
-            }
-          } else {
-            Write-Host "Installing Playwright Chromium browser..."
-            npx playwright install --with-deps chromium
-          }
-          
-          # Grant rdpuser access to browser binaries
-          $null = cmd /c "icacls `"$browsersPath`" /grant rdpuser:(OI)(CI)F /T /Q 2>&1"
-          $global:LASTEXITCODE = 0
-          
-          Write-Host "Playwright + Chromium ready at: $browsersPath"
-        continue-on-error: true
-
-      - name: Find previous workspace artifact
-        id: find-artifact
+      - name: Restore workspace from snapshot branch
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
+          . "$env:GITHUB_WORKSPACE\workflow-timeout.ps1"
           $repo = "${{ github.repository }}"
-          $currentRunId = "${{ github.run_id }}"
-          
-          # Brief wait for previous session's artifact upload
-          $maxWaitMinutes = 15
-          $waitedMinutes = 0
-          
-          while ($waitedMinutes -lt $maxWaitMinutes) {
-            $inProgressRuns = gh run list --repo $repo --workflow "rdp-session.yml" --status in_progress --json databaseId 2>$null | ConvertFrom-Json
-            $otherInProgress = $inProgressRuns | Where-Object { $_.databaseId -ne [int64]$currentRunId }
-            
-            if ($otherInProgress -and $otherInProgress.Count -gt 0) {
-              Write-Host "Previous session still running, waiting..."
-              Start-Sleep -Seconds 30
-              $waitedMinutes += 0.5
-            } else {
-              break
-            }
-          }
-          
-          # Find the latest artifact
-          $result = gh api "repos/$repo/actions/artifacts" --jq '[.artifacts[] | select(.name == "openclaw-workspace" and .expired == false)] | first | {id: .id, run_id: .workflow_run.id}' 2>$null | ConvertFrom-Json
-          
-          if ($result -and $result.id) {
-            Write-Host "Found workspace artifact from run: $($result.run_id)"
-            echo "RUN_ID=$($result.run_id)" >> $env:GITHUB_OUTPUT
-            echo "FOUND=true" >> $env:GITHUB_OUTPUT
-          } else {
-            Write-Host "No previous workspace artifact found"
-            echo "FOUND=false" >> $env:GITHUB_OUTPUT
+          $snapshotBranch = "workspace-snapshots"
+          $branch = "workspace-snapshots"
+          $workspace = "C:\Users\rdpuser\.openclaw\workspace"
+          $tempRoot = "$env:TEMP\openclaw-workspace-restore"
+          $cloneDir = "$tempRoot\repo"
+          $zipPath = "$cloneDir\workspace.zip"
+          $repoUrl = "https://github.com/$repo.git"
+          $extraHeader = "AUTHORIZATION: bearer $env:GH_TOKEN"
+
+          Remove-Item -Path $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
+
+          Write-Host "Attempting restore from $branch branch..."
+          $cloneOk = $false
+          try {
+            Invoke-WithTimeout -Activity "Cloning snapshot branch" -TimeoutSeconds 900 -ScriptBlock {
+              param($ExtraHeader, $RepoUrl, $CloneDir, $Branch)
+              git -c http.extraheader="$ExtraHeader" clone --depth 1 --branch $Branch $RepoUrl $CloneDir | Out-Null
+            } -ArgumentList $extraHeader, $repoUrl, $cloneDir, $branch | Out-Null
+            $cloneOk = $true
+          } catch {}
+
+          if (-not $cloneOk) {
+            Write-Host "No snapshot branch found; skipping restore"
+            exit 0
           }
 
-      - name: Restore workspace from artifact
-        if: steps.find-artifact.outputs.FOUND == 'true'
-        uses: actions/download-artifact@v7
-        with:
-          name: openclaw-workspace
-          path: C:\Users\rdpuser\.openclaw\workspace
-          github-token: ${{ secrets.GH_PAT }}
-          run-id: ${{ steps.find-artifact.outputs.RUN_ID }}
+          if (-not (Test-Path $zipPath)) {
+            Write-Host "Snapshot zip not found; skipping restore"
+            exit 0
+          }
+
+          Write-Host "Restoring workspace from snapshot zip"
+          if (Test-Path $workspace) { Remove-Item -Path $workspace -Recurse -Force -ErrorAction SilentlyContinue }
+          New-Item -ItemType Directory -Path $workspace -Force | Out-Null
+          Invoke-WithTimeout -Activity "Expanding workspace snapshot" -TimeoutSeconds 1800 -ScriptBlock {
+            param($Zip, $Destination)
+            Expand-Archive -Path $Zip -DestinationPath $Destination -Force
+          } -ArgumentList $zipPath, $workspace | Out-Null
+        continue-on-error: true
+
+      - name: Warm up OpenClaw bundled deps (one-time)
+        shell: pwsh
+        run: |
+          . "$env:GITHUB_WORKSPACE\workflow-timeout.ps1"
+          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
+          $env:NPM_CONFIG_PREFIX = "$rdpUserHome\.npm-global"
+          $env:PATH = "$rdpUserHome\.npm-global;$env:PATH"
+          $marker = "$rdpUserHome\.openclaw\.deps-warmup"
+          if (Test-Path $marker) {
+            Write-Host "Warm-up already done; skipping"
+            exit 0
+          }
+
+          Write-Host "Running OpenClaw doctor --fix to preinstall bundled deps..."
+          try {
+            $output = Invoke-WithTimeout -Activity "OpenClaw doctor --fix" -TimeoutSeconds 1800 -ScriptBlock {
+              Invoke-NativeChecked { openclaw doctor --fix }
+            }
+            Write-Host "OpenClaw doctor --fix completed"
+            New-Item -ItemType File -Path $marker -Force | Out-Null
+            Write-Host "Warm-up complete"
+          } catch {
+            Write-Host "WARNING: Warm-up failed (non-fatal): $_"
+          }
         continue-on-error: true
 
       - name: Start OpenClaw gateway
@@ -643,13 +576,28 @@ jobs:
         run: |
           $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
           $password = $env:RDP_PASSWORD
-          
-          # Create startup script (with stderr capture for crash diagnosis)
+          $gatewayUrl = "http://127.0.0.1:18789/"
+          $nodePath = (Get-Command node -ErrorAction SilentlyContinue).Source
+          if (-not $nodePath) { $nodePath = "node" }
+          $stdoutLog = "C:\Users\rdpuser\.openclaw\gateway-stdout.log"
+          $stderrLog = "C:\Users\rdpuser\.openclaw\gateway-stderr.log"
+          New-Item -ItemType File -Path $stdoutLog -Force | Out-Null
+          New-Item -ItemType File -Path $stderrLog -Force | Out-Null
+
+          # Clear stale listener if port is already in use
+          $listener = Get-NetTCPConnection -LocalPort 18789 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($listener) {
+            $pid = $listener.OwningProcess
+            Write-Host "Port 18789 already in use by PID $pid; terminating"
+            Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+          }
+           
+           # Create startup script (with stderr capture for crash diagnosis)
           $scriptContent = '$env:PATH = "C:\Users\rdpuser\.npm-global;" + $env:PATH' + "`r`n"
-          $scriptContent += '$env:PLAYWRIGHT_CHROMIUM_USE_HEADLESS_NEW = "1"' + "`r`n"
-          $scriptContent += '$env:PLAYWRIGHT_BROWSERS_PATH = "C:\Users\rdpuser\.playwright-browsers"' + "`r`n"
-          $scriptContent += '$logFile = "C:\Users\rdpuser\.openclaw\gateway-crash.log"' + "`r`n"
-          $scriptContent += 'Start-Process -WindowStyle Hidden -FilePath "node" -ArgumentList "C:\Users\rdpuser\.npm-global\node_modules\openclaw\openclaw.mjs", "gateway" -WorkingDirectory "C:\Users\rdpuser\.openclaw" -RedirectStandardError $logFile'
+          $scriptContent += '$stdoutFile = "C:\Users\rdpuser\.openclaw\gateway-stdout.log"' + "`r`n"
+          $scriptContent += '$stderrFile = "C:\Users\rdpuser\.openclaw\gateway-stderr.log"' + "`r`n"
+          $scriptContent += 'Start-Process -WindowStyle Hidden -FilePath "' + $nodePath + '" -ArgumentList "C:\Users\rdpuser\.npm-global\node_modules\openclaw\openclaw.mjs", "gateway", "--force" -WorkingDirectory "C:\Users\rdpuser\.openclaw" -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile'
           $scriptPath = "$rdpUserHome\start-openclaw.ps1"
           $scriptContent | Out-File -FilePath $scriptPath -Encoding UTF8
           
@@ -658,34 +606,51 @@ jobs:
           $batchContent += 'powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\Users\rdpuser\start-openclaw.ps1"'
           $batchPath = "$rdpUserHome\start-openclaw.bat"
           $batchContent | Out-File -FilePath $batchPath -Encoding ASCII
-          
+           
           # Create scheduled task using schtasks.exe (runs at system startup as rdpuser)
           $taskName = "OpenClawGateway"
           schtasks /Create /TN $taskName /TR $batchPath /SC ONSTART /RU "rdpuser" /RP $password /RL HIGHEST /F
           
-          if ($LASTEXITCODE -eq 0) {
-            schtasks /Run /TN $taskName
-            Write-Host "OpenClaw gateway scheduled task created and started"
-          } else {
+           if ($LASTEXITCODE -eq 0) {
+             schtasks /Run /TN $taskName
+             Write-Host "OpenClaw gateway scheduled task created and started"
+           } else {
             Write-Host "WARNING: Could not create scheduled task"
           }
 
-      - name: Start OpenClaw managed browser
-        if: github.event.inputs.start_managed_browser == 'true'
-        shell: pwsh
-        run: |
-          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
-          $env:NPM_CONFIG_PREFIX = "$rdpUserHome\.npm-global"
-          $env:PATH = "$rdpUserHome\.npm-global;$env:PATH"
-          $env:PLAYWRIGHT_BROWSERS_PATH = "$rdpUserHome\.playwright-browsers"
-          
-          # Wait for gateway to be ready
-          Write-Host "Waiting for OpenClaw gateway to be ready..."
-          $maxWait = 30
+          # Direct start + retry loop before long wait
+          $stdoutFile = "C:\Users\rdpuser\.openclaw\gateway-stdout.log"
+          $stderrFile = "C:\Users\rdpuser\.openclaw\gateway-stderr.log"
+          $nodePath = (Get-Command node -ErrorAction SilentlyContinue).Source
+          if (-not $nodePath) { $nodePath = "node" }
+          $gatewayStarted = $false
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            Write-Host "Gateway start attempt $attempt/3 (direct)"
+            Start-Process -WindowStyle Hidden -FilePath $nodePath -ArgumentList "C:\Users\rdpuser\.npm-global\node_modules\openclaw\openclaw.mjs", "gateway", "--force" -WorkingDirectory "C:\Users\rdpuser\.openclaw" -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
+            $probeWait = 0
+            $probeMaxWait = 10
+            while ($probeWait -lt $probeMaxWait) {
+              try {
+                $resp = Invoke-WebRequest -Uri $gatewayUrl -UseBasicParsing -TimeoutSec 2 -ErrorAction SilentlyContinue
+                if ($resp.StatusCode -eq 200 -or $resp.StatusCode -eq 401) {
+                  $gatewayStarted = $true
+                  break
+                }
+              } catch {}
+              Start-Sleep -Seconds 2
+              $probeWait += 2
+            }
+            if ($gatewayStarted) { break }
+            schtasks /Run /TN $taskName | Out-Null
+            Start-Sleep -Seconds 2
+          }
+
+          # Wait for gateway readiness and surface crash logs if it fails
+          $maxWait = 180
           $waited = 0
           while ($waited -lt $maxWait) {
             try {
-              $resp = Invoke-WebRequest -Uri "http://127.0.0.1:18789/" -UseBasicParsing -TimeoutSec 2 -ErrorAction SilentlyContinue
+              $resp = Invoke-WebRequest -Uri $gatewayUrl -UseBasicParsing -TimeoutSec 2 -ErrorAction SilentlyContinue
               if ($resp.StatusCode -eq 200 -or $resp.StatusCode -eq 401) {
                 Write-Host "Gateway is ready"
                 break
@@ -694,55 +659,28 @@ jobs:
             Start-Sleep -Seconds 2
             $waited += 2
           }
-          
-          Write-Host "Starting OpenClaw managed browser (headless, no-sandbox)..."
-          
-          # Use new headless mode (harder to detect than legacy headless)
-          $env:PLAYWRIGHT_CHROMIUM_USE_HEADLESS_NEW = "1"
-          
-          # Start the openclaw browser (flag goes BEFORE subcommand per docs)
-          # Try with --browser-profile first, fall back to default if not supported
-          $startOutput = openclaw browser --browser-profile openclaw start 2>&1 | Out-String
-          if ($startOutput -match "unknown option") {
-            Write-Host "WARNING: --browser-profile not supported, trying without profile flag..."
-            $startOutput = openclaw browser start 2>&1 | Out-String
-          }
-          Write-Host "Browser start output: $startOutput"
-          Start-Sleep -Seconds 5
-          
-          # Check browser status
-          $browserStatus = openclaw browser --browser-profile openclaw status 2>&1 | Out-String
-          if ($browserStatus -match "unknown option") {
-            $browserStatus = openclaw browser status 2>&1 | Out-String
-          }
-          Write-Host "Browser status: $browserStatus"
-          
-          # Verify CDP is reachable on the configured port
-          try {
-            $cdpCheck = Invoke-WebRequest -Uri "http://127.0.0.1:18800/json/version" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
-            Write-Host "Browser CDP endpoint is reachable on port 18800"
-            
-            # Apply stealth: set realistic user-agent via browser control API
-            $gatewayPort = 18789
-            $ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-            $body = @{ headers = @{ "User-Agent" = $ua } } | ConvertTo-Json -Compress
-            try {
-              Invoke-WebRequest -Uri "http://127.0.0.1:$gatewayPort/browser/set/headers?profile=openclaw" `
-                -Method POST -UseBasicParsing -TimeoutSec 5 `
-                -Headers @{ "Authorization" = "Bearer openclaw"; "Content-Type" = "application/json" } `
-                -Body $body -ErrorAction Stop | Out-Null
-              Write-Host "Stealth: User-Agent set"
-            } catch {
-              Write-Host "WARNING: Could not set User-Agent (non-critical)"
+
+          if ($waited -ge $maxWait) {
+            Write-Host "WARNING: Gateway not reachable after $maxWait seconds"
+            $stdoutLog = "C:\Users\rdpuser\.openclaw\gateway-stdout.log"
+            $stderrLog = "C:\Users\rdpuser\.openclaw\gateway-stderr.log"
+            if (Test-Path $stdoutLog) {
+              Write-Host "--- gateway-stdout.log (tail) ---"
+              Get-Content -Path $stdoutLog -Tail 200
+              Write-Host "--- end gateway-stdout.log ---"
+            } else {
+              Write-Host "No gateway stdout log found at $stdoutLog"
             }
-            
-            # Apply stealth: set realistic locale and timezone
-            openclaw browser --browser-profile openclaw set locale en-US 2>$null
-            openclaw browser --browser-profile openclaw set timezone America/New_York 2>$null
-            Write-Host "Stealth: locale=en-US, timezone=America/New_York"
-          } catch {
-            Write-Host "WARNING: Browser CDP endpoint not reachable yet (gateway may auto-start it on first use)"
+            if (Test-Path $stderrLog) {
+              Write-Host "--- gateway-stderr.log (tail) ---"
+              Get-Content -Path $stderrLog -Tail 200
+              Write-Host "--- end gateway-stderr.log ---"
+            } else {
+              Write-Host "No gateway stderr log found at $stderrLog"
+            }
           }
+
+          $global:LASTEXITCODE = 0
         continue-on-error: true
 
       - name: Display Connection Info
@@ -791,7 +729,7 @@ jobs:
           Write-Host "  $rdpUserHome\projects"
           Write-Host "  $rdpUserHome\.npm-global"
           Write-Host ""
-          Write-Host "Session will auto-chain at ~${{ steps.session.outputs.CHAIN_TRIGGER_MINUTES }} minutes"
+          Write-Host "Session will auto-chain at ~${{ env.CHAIN_TRIGGER_MINUTES }} minutes"
           Write-Host "=============================================="
 
       - name: Keep session alive (phase 1 - until chain trigger)
@@ -800,20 +738,21 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-          OPENCLAW_BROWSER_ENABLED: ${{ github.event.inputs.start_managed_browser }}
         run: |
           # Calculate times from JOB START, not from now.
           # Phase 1 starts after setup (~5-20 min), so using (Get-Date) here
           # would overshoot the 360-min GitHub limit and get killed before chaining.
           $jobStart = [DateTime]::new([long]"${{ steps.session.outputs.JOB_START_TICKS }}")
-          $chainTime = $jobStart.AddMinutes([int]"${{ steps.session.outputs.CHAIN_TRIGGER_MINUTES }}")
-          $hardLimitTime = $jobStart.AddMinutes(350)  # Stop 10 min before GitHub 360 limit, leaving room for fallback steps
+          $chainTime = $jobStart.AddMinutes(${{ env.CHAIN_TRIGGER_MINUTES }})
+          $hardLimitTime = $jobStart.AddMinutes(358)  # Stop 2 min before GitHub 360 limit, leaving room for fallback steps
           $saveInterval = ${{ env.SAVE_INTERVAL_MINUTES }}
           $rdpUserHome = "C:\Users\rdpuser"
           $repo = "${{ github.repository }}"
           $sessionId = "${{ steps.session.outputs.SESSION_ID }}"
           $chainCount = [int]"${{ steps.session.outputs.CHAIN_COUNT }}"
           $openclawCacheVersion = "${{ steps.session.outputs.OPENCLAW_CACHE_VERSION }}"
+          $uploaderRoot = Join-Path $env:RUNNER_TEMP "workspace-artifact-uploader"
+          $uploaderScript = Join-Path $uploaderRoot "upload-workspace.mjs"
           
           $setupElapsed = [math]::Round(((Get-Date) - $jobStart).TotalMinutes, 1)
           $remainingMinutes = [math]::Round(($chainTime - (Get-Date)).TotalMinutes, 1)
@@ -821,8 +760,8 @@ jobs:
           Write-Host "Phase 1: Keep alive until chain trigger"
           Write-Host "  Job started:       $($jobStart.ToString('HH:mm:ss'))"
           Write-Host "  Setup took:        $setupElapsed min"
-          Write-Host "  Chain trigger at:  $($chainTime.ToString('HH:mm:ss')) (${{ steps.session.outputs.CHAIN_TRIGGER_MINUTES }} min from job start)"
-          Write-Host "  Hard limit at:     $($hardLimitTime.ToString('HH:mm:ss')) (350 min from job start)"
+          Write-Host "  Chain trigger at:  $($chainTime.ToString('HH:mm:ss')) (${{ env.CHAIN_TRIGGER_MINUTES }} min from job start)"
+          Write-Host "  Hard limit at:     $($hardLimitTime.ToString('HH:mm:ss')) (358 min from job start)"
           Write-Host "  Remaining:         $remainingMinutes min"
           Write-Host "  Save interval:     every $saveInterval min"
           Write-Host "  Upgrade openclaw:  Cancel workflow from GitHub Actions UI"
@@ -830,11 +769,139 @@ jobs:
           if ((Get-Date) -ge $chainTime) {
             Write-Host "WARNING: Setup took longer than chain window! Proceeding to chain immediately."
           }
+
+          function Ensure-WorkspaceUploader {
+            if (Test-Path $uploaderScript) {
+              return
+            }
+
+            New-Item -ItemType Directory -Path $uploaderRoot -Force | Out-Null
+            Write-Host "Installing custom artifact uploader..."
+            npm install --prefix $uploaderRoot --silent @actions/artifact | Out-Null
+
+            @(
+              'import { DefaultArtifactClient } from "@actions/artifact";',
+              '',
+              'const [artifactName, artifactPath] = process.argv.slice(2);',
+              'if (!artifactName || !artifactPath) {',
+              '  throw new Error("Missing artifact name or path");',
+              '}',
+              '',
+              'const client = new DefaultArtifactClient();',
+              'try {',
+              '  await client.deleteArtifact(artifactName);',
+              '} catch (error) {',
+              '  if (error?.name !== "ArtifactNotFoundError") {',
+              '    console.warn(`Unable to delete existing artifact: ${error.message}`);',
+              '  }',
+              '}',
+              '',
+              'await client.uploadArtifact(artifactName, [artifactPath], {',
+              '  retentionDays: 90,',
+              '  compressionLevel: 0',
+              '});',
+              '',
+              'console.log(`Uploaded ${artifactName}`);'
+            ) | Set-Content -Path $uploaderScript -Encoding UTF8
+          }
+
+          function Upload-WorkspaceSnapshot {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string]$SnapshotName
+            )
+
+            $workspace = "C:\Users\rdpuser\.openclaw\workspace"
+            if (-not (Test-Path $workspace)) {
+              Write-Host "  [SNAPSHOT] Workspace missing, skipping upload"
+              return $false
+            }
+            $zipPath = "$env:TEMP\workspace.zip"
+            if (Test-Path $zipPath) { Remove-Item -Path $zipPath -Force -ErrorAction SilentlyContinue }
+
+            Write-Host "  [SNAPSHOT] Creating workspace zip"
+            Invoke-WithTimeout -Activity "Compressing workspace" -TimeoutSeconds 1800 -ScriptBlock {
+              param($SourceWorkspace, $DestinationZip)
+              Compress-Archive -Path "$SourceWorkspace\*" -DestinationPath $DestinationZip -Force
+            } -ArgumentList $workspace, $zipPath | Out-Null
+
+            Write-Host "  [SNAPSHOT] Publishing to branch: $snapshotBranch"
+            $tempRoot = "$env:TEMP\openclaw-workspace-snapshot"
+            $cloneDir = "$tempRoot\repo"
+            $repoUrl = "https://github.com/$repo.git"
+            $extraHeader = "AUTHORIZATION: bearer $env:GH_TOKEN"
+
+            Remove-Item -Path $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
+
+            $cloneOk = $false
+            try {
+              Invoke-WithTimeout -Activity "Cloning snapshot branch" -TimeoutSeconds 900 -ScriptBlock {
+                param($ExtraHeader, $RepoUrl, $CloneDir, $Branch)
+                Invoke-NativeChecked { git -c http.extraheader="$ExtraHeader" clone --depth 1 --branch $Branch $RepoUrl $CloneDir }
+              } -ArgumentList $extraHeader, $repoUrl, $cloneDir, $snapshotBranch | Out-Null
+              $cloneOk = $true
+            } catch {}
+
+            if (-not $cloneOk) {
+              Write-Host "  [SNAPSHOT] Branch missing; creating $snapshotBranch"
+              try {
+                Invoke-WithTimeout -Activity "Cloning repo for snapshot branch" -TimeoutSeconds 900 -ScriptBlock {
+                  param($ExtraHeader, $RepoUrl, $CloneDir)
+                  Invoke-NativeChecked { git -c http.extraheader="$ExtraHeader" clone --depth 1 $RepoUrl $CloneDir }
+                } -ArgumentList $extraHeader, $repoUrl, $cloneDir | Out-Null
+              } catch {
+                Write-Host "  [SNAPSHOT] ERROR: clone failed"
+                return $false
+              }
+              Push-Location $cloneDir
+              git checkout --orphan $snapshotBranch | Out-Null
+              Get-ChildItem -Path $cloneDir -Force | Where-Object { $_.Name -notin ".git" } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+              "workspace snapshots" | Out-File -FilePath "$cloneDir\README.md" -Encoding ASCII
+              git add README.md
+              git -c user.name="openclaw" -c user.email="openclaw@users.noreply.github.com" commit -m "init snapshots" | Out-Null
+              Invoke-WithTimeout -Activity "Pushing snapshot branch init" -TimeoutSeconds 900 -ScriptBlock {
+                param($ExtraHeader, $Branch)
+                Invoke-NativeChecked { git -c http.extraheader="$ExtraHeader" push -u origin $Branch }
+              } -ArgumentList $extraHeader, $snapshotBranch | Out-Null
+              Pop-Location
+            }
+
+            Push-Location $cloneDir
+            Copy-Item -Path $zipPath -Destination "$cloneDir\workspace.zip" -Force
+            git add workspace.zip
+            $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            git -c user.name="openclaw" -c user.email="openclaw@users.noreply.github.com" commit -m "snapshot $timestamp" | Out-Null
+            try {
+              Invoke-WithTimeout -Activity "Pushing snapshot" -TimeoutSeconds 900 -ScriptBlock {
+                param($ExtraHeader, $Branch)
+                Invoke-NativeChecked { git -c http.extraheader="$ExtraHeader" push origin $Branch }
+              } -ArgumentList $extraHeader, $snapshotBranch | Out-Null
+              $pushOk = $true
+            } catch {
+              $pushOk = $false
+            }
+            Pop-Location
+
+            if ($pushOk) {
+              Write-Host "  [SNAPSHOT] Uploaded snapshot to branch"
+              return $true
+            }
+
+            Write-Host "  [SNAPSHOT] ERROR: push failed"
+            return $false
+          }
+
+          function Get-SnapshotName {
+            return "openclaw-workspace"
+          }
           
           # Track state
           $lastSaveTime = Get-Date
           $chainTriggered = $false
           $loopCount = 0
+          $heartbeatInterval = [TimeSpan]::FromMinutes(1)
+          $nextHeartbeat = Get-Date
           # GC interval: force garbage collection every 30 iterations (~30 min)
           # to prevent PowerShell memory accumulation over 5+ hour sessions
           $gcInterval = 30
@@ -843,14 +910,20 @@ jobs:
           function Save-Secrets {
             $configFile = "$rdpUserHome\.openclaw\openclaw.json"
             $authFile = "$rdpUserHome\.openclaw\agents\main\agent\auth-profiles.json"
-            try {
-              if (Test-Path $configFile) {
-                Get-Content $configFile -Raw | gh secret set OPENCLAW_CONFIG --repo $repo 2>&1 | Out-Null
-              }
-              if (Test-Path $authFile) {
-                Get-Content $authFile -Raw | gh secret set OPENCLAW_AUTH_PROFILES --repo $repo 2>&1 | Out-Null
-              }
-              Write-Host "  [SAVE] Secrets saved at $(Get-Date -Format 'HH:mm:ss')"
+          try {
+            if (Test-Path $configFile) {
+              Invoke-WithTimeout -Activity "Saving OPENCLAW_CONFIG secret" -TimeoutSeconds 300 -ScriptBlock {
+                param($ConfigPath, $RepoName)
+                Invoke-NativeChecked { Get-Content $ConfigPath -Raw | gh secret set OPENCLAW_CONFIG --repo $RepoName }
+              } -ArgumentList $configFile, $repo | Out-Null
+            }
+            if (Test-Path $authFile) {
+              Invoke-WithTimeout -Activity "Saving OPENCLAW_AUTH_PROFILES secret" -TimeoutSeconds 300 -ScriptBlock {
+                param($AuthPath, $RepoName)
+                Invoke-NativeChecked { Get-Content $AuthPath -Raw | gh secret set OPENCLAW_AUTH_PROFILES --repo $RepoName }
+              } -ArgumentList $authFile, $repo | Out-Null
+            }
+            Write-Host "  [SAVE] Secrets saved at $(Get-Date -Format 'HH:mm:ss')"
             } catch {
               Write-Host "  [SAVE] WARNING: Secret save failed: $_"
             }
@@ -867,6 +940,7 @@ jobs:
                 session_id = $sessionId
                 chain_count = $nextChainCount
                 openclaw_cache_version = $openclawCacheVersion
+                snapshot_source_run_id = "${{ github.run_id }}"
               }
             } | ConvertTo-Json -Compress
             
@@ -908,125 +982,26 @@ jobs:
               # Non-critical, swallow errors
             }
           }
-          
-          # Main keep-alive loop: runs from setup completion until hard limit
-          # At chainTime: saves secrets + triggers next session, then continues as phase 2
+
+          # Main keep-alive loop: runs from setup completion until chain time or hard limit.
+          # We stop at chain time so the workspace artifact can upload before the
+          # next session is dispatched, minimizing handoff downtime.
           while ((Get-Date) -lt $hardLimitTime) {
+            $now = Get-Date
+            if ($now -lt $nextHeartbeat) {
+              Start-Sleep -Seconds [math]::Ceiling(($nextHeartbeat - $now).TotalSeconds)
+              $now = Get-Date
+            }
+
             $loopCount++
-            $elapsed = [math]::Round(((Get-Date) - $jobStart).TotalMinutes, 1)
+            $elapsed = [math]::Round(($now - $jobStart).TotalMinutes, 1)
             
             if (-not $chainTriggered) {
-              $left = [math]::Round(($chainTime - (Get-Date)).TotalMinutes, 1)
-              Write-Host "Session alive at $(Get-Date -Format 'HH:mm:ss') | ${elapsed}min elapsed | ${left}min until chain"
+              $left = [math]::Round(($chainTime - $now).TotalMinutes, 1)
+              Write-Host "Session alive at $($now.ToString('HH:mm:ss')) | ${elapsed}min elapsed | ${left}min until chain"
             } else {
-              $left = [math]::Round(($hardLimitTime - (Get-Date)).TotalMinutes, 1)
-              Write-Host "Session alive at $(Get-Date -Format 'HH:mm:ss') | ${elapsed}min elapsed | ${left}min until hard limit (chained)"
-            }
-            
-            # Check for manual restart request (touch-file trigger)
-            $restartFlag = "$rdpUserHome\.openclaw\.restart"
-            if (Test-Path $restartFlag) {
-              Write-Host "  Restart flag detected - killing OpenClaw..."
-              Remove-Item $restartFlag -Force -ErrorAction SilentlyContinue
-              taskkill /F /IM node.exe 2>$null
-              Start-Sleep -Seconds 2
-              # Reset fail counter so it gets a fresh start below
-              $script:openclawFailCount = 0
-            }
-            
-            # Check if OpenClaw is running, restart if not (with backoff and error capture)
-            $nodeProcs = Get-Process -Name "node" -ErrorAction SilentlyContinue
-            if (-not $nodeProcs) {
-              Write-Host "  OpenClaw not running, restarting via scheduled task..."
-
-              # Restart using the scheduled task so it runs as rdpuser (not the runner service account)
-              schtasks /Run /TN "OpenClawGateway" 2>$null
-
-              # Wait and confirm it came back up
-              Start-Sleep -Seconds 15
-              $stillRunning = Get-Process -Name "node" -ErrorAction SilentlyContinue
-              if ($stillRunning) {
-                Write-Host "  OpenClaw process started"
-              } else {
-                Write-Host "  WARNING: OpenClaw still not running after restart attempt"
-              }
-            } else {
-              # OpenClaw is running
-            }
-            # Release process list reference immediately
-            $nodeProcs = $null
-            
-            if ($env:OPENCLAW_BROWSER_ENABLED -eq "true") {
-              # Check if OpenClaw managed browser CDP is still reachable
-              try {
-                $cdpCheck = Invoke-WebRequest -Uri "http://127.0.0.1:18800/json/version" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
-                # Browser is reachable, reset fail counter
-                if ((Test-Path variable:script:browserFailCount) -and $script:browserFailCount -gt 0) {
-                  Write-Host "  Browser CDP confirmed reachable (reset fail counter from $($script:browserFailCount))"
-                }
-                $script:browserFailCount = 0
-              } catch {
-                if (-not (Test-Path variable:script:browserFailCount)) { $script:browserFailCount = 0 }
-                $script:browserFailCount++
-                
-                if ($script:browserFailCount -le 3) {
-                  Write-Host "  WARNING: Browser CDP not reachable on port 18800 (attempt $($script:browserFailCount)/3), attempting restart..."
-                  
-                  # Try via gateway HTTP API (works regardless of which user the keepalive runs as)
-                  $restarted = $false
-                  try {
-                    $startResp = Invoke-WebRequest -Uri "http://127.0.0.1:18789/browser/start?profile=openclaw" `
-                      -Method POST -UseBasicParsing -TimeoutSec 10 `
-                      -Headers @{ "Authorization" = "Bearer openclaw" } `
-                      -ErrorAction Stop
-                    if ($startResp.StatusCode -eq 200) {
-                      Start-Sleep -Seconds 8
-                      try {
-                        Invoke-WebRequest -Uri "http://127.0.0.1:18800/json/version" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop | Out-Null
-                        Write-Host "  Browser restarted successfully via gateway API"
-                        $restarted = $true
-                        $script:browserFailCount = 0
-                      } catch {
-                        Write-Host "  Gateway accepted start request but CDP still not reachable"
-                      }
-                    }
-                  } catch {
-                    Write-Host "  Gateway API start request failed: $($_.Exception.Message)"
-                  }
-                  
-                  # Fallback: try CLI as rdpuser via scheduled task
-                  if (-not $restarted) {
-                    $taskScript = "$rdpUserHome\start-browser.ps1"
-                    $scriptLines = @(
-                      ('$env:PATH = "' + $rdpUserHome + '\.npm-global;" + $env:PATH'),
-                      ('$env:PLAYWRIGHT_BROWSERS_PATH = "' + $rdpUserHome + '\.playwright-browsers"'),
-                      '$env:PLAYWRIGHT_CHROMIUM_USE_HEADLESS_NEW = "1"',
-                      'openclaw browser --browser-profile openclaw start 2>&1 | Out-Null'
-                    )
-                    $scriptLines -join "`r`n" | Out-File -FilePath $taskScript -Encoding UTF8 -Force
-                    $batchWrapper = "$rdpUserHome\start-browser.bat"
-                    $batchLines = '@echo off', ('powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $taskScript + '"')
-                    $batchLines -join "`r`n" | Out-File -FilePath $batchWrapper -Encoding ASCII -Force
-                    
-                    schtasks /Create /TN "OpenClawBrowserRestart" /TR $batchWrapper /SC ONCE /ST 00:00 /RU "rdpuser" /RP $env:RDP_PASSWORD /RL HIGHEST /F 2>$null
-                    schtasks /Run /TN "OpenClawBrowserRestart" 2>$null
-                    Start-Sleep -Seconds 8
-                    
-                    try {
-                      Invoke-WebRequest -Uri "http://127.0.0.1:18800/json/version" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop | Out-Null
-                      Write-Host "  Browser restarted successfully via scheduled task"
-                      $script:browserFailCount = 0
-                    } catch {
-                      Write-Host "  WARNING: Browser restart via scheduled task also failed"
-                    }
-                  }
-                } elseif ($script:browserFailCount -eq 4) {
-                  Write-Host "  Browser CDP failed 3 restart attempts - giving up automatic restarts."
-                  Write-Host "  The gateway will auto-start the browser on the next browser tool call."
-                  Write-Host "  Or RDP in and run: openclaw browser --browser-profile openclaw start"
-                }
-                # After giving up, stay silent (no spam every 60s)
-              }
+              $left = [math]::Round(($hardLimitTime - $now).TotalMinutes, 1)
+              Write-Host "Session alive at $($now.ToString('HH:mm:ss')) | ${elapsed}min elapsed | ${left}min until hard limit (chained)"
             }
             
             # Periodic secret save
@@ -1040,20 +1015,24 @@ jobs:
             if (-not $chainTriggered -and (Get-Date) -ge $chainTime) {
               Write-Host ""
               Write-Host "=========================================="
-              Write-Host "  CHAIN TIME - saving and triggering"
+              Write-Host "  CHAIN TIME - saving, snapshotting, and triggering"
               Write-Host "=========================================="
               Save-Secrets
+              $snapshotName = Get-SnapshotName
+              $null = Upload-WorkspaceSnapshot -SnapshotName $snapshotName
               $chainTriggered = Trigger-Chain
               if ($chainTriggered) {
-                # Write marker so if: always() steps know chain was already done
                 echo "CHAIN_DONE=true" >> $env:GITHUB_OUTPUT
-                Write-Host "Chain triggered successfully - continuing as phase 2 until hard limit"
+                Write-Host "Chain triggered successfully - continuing phase 2 until hard limit"
               } else {
                 Write-Host "WARNING: Chain trigger failed - will retry via if:always() steps"
               }
+              Write-Host "Phase 1 complete - old session continues until hard limit"
               Write-Host "=========================================="
               Write-Host ""
             }
+
+            # No periodic snapshot uploads; only snapshot at chain time
             
             # Periodic garbage collection to prevent memory accumulation.
             # PowerShell retains objects in its pipeline/variable tables across
@@ -1065,7 +1044,10 @@ jobs:
               [System.GC]::WaitForPendingFinalizers()
             }
             
-            Start-Sleep -Seconds 60
+            $nextHeartbeat = $nextHeartbeat.Add($heartbeatInterval)
+            if ($nextHeartbeat -lt (Get-Date)) {
+              $nextHeartbeat = (Get-Date).Add($heartbeatInterval)
+            }
           }
           
           # Final save before exiting
@@ -1081,6 +1063,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
+          . "$env:GITHUB_WORKSPACE\workflow-timeout.ps1"
           $rdpUserHome = "C:\Users\rdpuser"
           $repo = "${{ github.repository }}"
           $configFile = "$rdpUserHome\.openclaw\openclaw.json"
@@ -1089,10 +1072,16 @@ jobs:
           Write-Host "Fallback secret save (in case keepalive was interrupted)..."
           try {
             if (Test-Path $configFile) {
-              Get-Content $configFile -Raw | gh secret set OPENCLAW_CONFIG --repo $repo
+              Invoke-WithTimeout -Activity "Saving OPENCLAW_CONFIG secret" -TimeoutSeconds 300 -ScriptBlock {
+                param($ConfigPath, $RepoName)
+                Invoke-NativeChecked { Get-Content $ConfigPath -Raw | gh secret set OPENCLAW_CONFIG --repo $RepoName }
+              } -ArgumentList $configFile, $repo | Out-Null
             }
             if (Test-Path $authFile) {
-              Get-Content $authFile -Raw | gh secret set OPENCLAW_AUTH_PROFILES --repo $repo
+              Invoke-WithTimeout -Activity "Saving OPENCLAW_AUTH_PROFILES secret" -TimeoutSeconds 300 -ScriptBlock {
+                param($AuthPath, $RepoName)
+                Invoke-NativeChecked { Get-Content $AuthPath -Raw | gh secret set OPENCLAW_AUTH_PROFILES --repo $RepoName }
+              } -ArgumentList $authFile, $repo | Out-Null
             }
             Write-Host "Secrets saved"
           } catch {
@@ -1104,6 +1093,7 @@ jobs:
         if: always()
         shell: pwsh
         run: |
+          . "$env:GITHUB_WORKSPACE\workflow-timeout.ps1"
           $workspace = "C:\Users\rdpuser\.openclaw\workspace"
           
           if (-not (Test-Path $workspace)) {
@@ -1168,30 +1158,88 @@ jobs:
           }
           
           # Remove empty directories left behind (single pass, deepest first)
-          Get-ChildItem -Path $workspace -Directory -Recurse -ErrorAction SilentlyContinue |
-            Sort-Object { $_.FullName.Length } -Descending |
-            ForEach-Object {
-              if (@(Get-ChildItem -Path $_.FullName -Force -ErrorAction SilentlyContinue).Count -eq 0) {
-                Write-Host "  Removing empty dir: $($_.FullName)"
-                Remove-Item -Path $_.FullName -Force -ErrorAction SilentlyContinue
+          Invoke-WithTimeout -Activity "Removing empty workspace directories" -TimeoutSeconds 900 -ScriptBlock {
+            param($RootWorkspace)
+            Get-ChildItem -Path $RootWorkspace -Directory -Recurse -ErrorAction SilentlyContinue |
+              Sort-Object { $_.FullName.Length } -Descending |
+              ForEach-Object {
+                if (@(Get-ChildItem -Path $_.FullName -Force -ErrorAction SilentlyContinue).Count -eq 0) {
+                  Write-Host "  Removing empty dir: $($_.FullName)"
+                  Remove-Item -Path $_.FullName -Force -ErrorAction SilentlyContinue
+                }
               }
-            }
+          } -ArgumentList $workspace | Out-Null
           
           # Summary
-          $stats = Get-ChildItem -Path $workspace -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+          $stats = Invoke-WithTimeout -Activity "Summarizing workspace files" -TimeoutSeconds 900 -ScriptBlock {
+            param($RootWorkspace)
+            Get-ChildItem -Path $RootWorkspace -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+          } -ArgumentList $workspace
           $fileCount = $stats.Count
           $sizeMB = [math]::Round($stats.Sum / 1MB, 1)
           Write-Host "Workspace ready for upload: $fileCount files, ${sizeMB} MB"
 
-      - name: Upload workspace artifact (for next session)
+      - name: Trigger next session
+        id: trigger-next-session
         if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: openclaw-workspace
-          path: C:\Users\rdpuser\.openclaw\workspace
-          retention-days: 90
-          if-no-files-found: ignore
-          overwrite: true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          . "$env:GITHUB_WORKSPACE\workflow-timeout.ps1"
+          Write-Host "Triggering next session after workspace upload..."
+
+          $sessionId = "${{ steps.session.outputs.SESSION_ID }}"
+          $nextChainCount = [int]"${{ steps.session.outputs.CHAIN_COUNT }}" + 1
+          $openclawCacheVersion = "${{ steps.session.outputs.OPENCLAW_CACHE_VERSION }}"
+          $repo = "${{ github.repository }}"
+
+          # If workflow was cancelled, toggle version to force openclaw upgrade
+          $keepaliveOutcome = "${{ steps.keepalive.outcome }}"
+          if ($keepaliveOutcome -eq "cancelled") {
+            if ($openclawCacheVersion -eq "v1") {
+              $newVersion = "v2"
+            } else {
+              $newVersion = "v1"
+            }
+            Write-Host "=========================================="
+            Write-Host "CANCEL DETECTED - UPGRADING OPENCLAW"
+            Write-Host "  Previous cache version: $openclawCacheVersion"
+            Write-Host "  New cache version:      $newVersion"
+            Write-Host "=========================================="
+            $openclawCacheVersion = $newVersion
+          }
+
+          $body = @{
+            event_type = 'chain-rdp'
+            client_payload = @{
+              session_id = $sessionId
+              chain_count = $nextChainCount
+              openclaw_cache_version = $openclawCacheVersion
+            }
+          } | ConvertTo-Json -Compress
+
+          $maxRetries = 3
+          for ($i = 1; $i -le $maxRetries; $i++) {
+            try {
+              Invoke-WithTimeout -Activity "Triggering next session" -TimeoutSeconds 300 -ScriptBlock {
+                param($Body, $RepoName)
+                Invoke-NativeChecked { $Body | gh api "repos/$RepoName/dispatches" --method POST --input - }
+              } -ArgumentList $body, $repo | Out-Null
+              Write-Host "Next session triggered successfully on attempt $i"
+              echo "CHAIN_DONE=true" >> $env:GITHUB_OUTPUT
+              break
+            } catch {
+              Write-Host "WARNING: Exception on attempt $i/$maxRetries - $_"
+            }
+            if ($i -lt $maxRetries) {
+              $wait = $i * 15
+              Write-Host "Retrying in $wait seconds..."
+              Start-Sleep -Seconds $wait
+            } else {
+              Write-Host "ERROR: All $maxRetries attempts to trigger next session failed!"
+            }
+          }
 
       - name: Trigger next session (fallback)
         if: always()
@@ -1199,10 +1247,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
+          . "$env:GITHUB_WORKSPACE\workflow-timeout.ps1"
           # Skip if keepalive already triggered the chain successfully
           $chainDone = "${{ steps.keepalive.outputs.CHAIN_DONE }}"
-          if ($chainDone -eq "true") {
-            Write-Host "Chain already triggered by keepalive loop - skipping fallback"
+          $triggerStepDone = "${{ steps.trigger-next-session.outputs.CHAIN_DONE }}"
+          if ($chainDone -eq "true" -or $triggerStepDone -eq "true") {
+            Write-Host "Chain already triggered - skipping fallback"
             exit 0
           }
           
@@ -1243,12 +1293,12 @@ jobs:
           $maxRetries = 3
           for ($i = 1; $i -le $maxRetries; $i++) {
             try {
-              $body | gh api "repos/$repo/dispatches" --method POST --input -
-              if ($LASTEXITCODE -eq 0) {
-                Write-Host "Next session triggered successfully on attempt $i"
-                break
-              }
-              Write-Host "WARNING: gh api exited with code $LASTEXITCODE (attempt $i/$maxRetries)"
+              Invoke-WithTimeout -Activity "Triggering next session" -TimeoutSeconds 300 -ScriptBlock {
+                param($Body, $RepoName)
+                Invoke-NativeChecked { $Body | gh api "repos/$RepoName/dispatches" --method POST --input - }
+              } -ArgumentList $body, $repo | Out-Null
+              Write-Host "Next session triggered successfully on attempt $i"
+              break
             } catch {
               Write-Host "WARNING: Exception on attempt $i/$maxRetries - $_"
             }
@@ -1280,12 +1330,4 @@ jobs:
         with:
           path: C:\Users\rdpuser\.npm-global
           key: npm-global-openclaw-${{ steps.session.outputs.OPENCLAW_CACHE_VERSION }}-${{ runner.os }}
-        continue-on-error: true
-
-      - name: Save Playwright browsers cache
-        if: ${{ always() && steps.cache-playwright.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v5
-        with:
-          path: C:\Users\rdpuser\.playwright-browsers
-          key: playwright-browsers-v1-${{ runner.os }}
         continue-on-error: true
